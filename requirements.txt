@@ -13,7 +13,7 @@ moodist==0.5.1
 msgspec
 ninja
 numpy
-omegaconf @ git+https://github.com/omry/omegaconf.git@117f7de07285e4d1324b9229eaf873de15279457  # to enable a recent antlr version
+omegaconf==2.4.0.dev4
 openai==1.86.0
 rich
 swebench
