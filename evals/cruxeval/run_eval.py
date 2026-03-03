@@ -104,10 +104,13 @@ def run_eval_worker(
     pbar: tqdm,
     max_gen: int,
     exc_queue: queue.Queue,
+    done_event: threading.Event,
 ) -> None:
     """
-    Worker thread: iterates over samples, calls g.generate() (blocking),
-    extracts answer, checks correctness. Signals ImpGen when done.
+    Worker thread: only runs on TP rank 0 within each DP group.
+    Iterates over samples, calls g.generate() (blocking), extracts answer,
+    checks correctness. Sets done_event when finished so the main thread
+    can drive g.stop() from its work loop.
     """
     try:
         for sample in samples:
@@ -143,7 +146,11 @@ def run_eval_worker(
         exc_queue.put(e)
         logger.exception("Exception in eval worker")
     finally:
-        g.stop()
+        # Signal the main thread to start calling g.stop(). Do NOT call
+        # g.stop() here: ImpGen.stop() needs to be called repeatedly from
+        # the main work loop on all TP ranks so both ranks put into
+        # _stop_queue before rank 0 sends the None termination packet.
+        done_event.set()
 
 
 def main(args: CruxEvalArgs) -> None:
@@ -187,45 +194,65 @@ def main(args: CruxEvalArgs) -> None:
     if is_rank_zero:
         dump_path.mkdir(parents=True, exist_ok=True)
 
+    # Only TP rank 0 within each DP group submits generation requests.
+    # TP rank 1 only drives g.work() — it must never call g.generate()
+    # because ImpGen routes futures through _tp_queue which only rank 0
+    # dequeues via _sync_q, so rank 1's futures would never be resolved.
+    is_tp_rank_zero = tp_group.rank() == 0
+
     results: list[dict] = []
     exc_queue: queue.Queue = queue.Queue()
-    pbar = tqdm(total=len(my_samples), desc=f"CRUXEval-O [dp={dp_rank}]", position=dp_rank)
+    done_event = threading.Event()
 
-    worker = threading.Thread(
-        target=run_eval_worker,
-        args=(my_samples, g, results, pbar, args.max_gen, exc_queue),
-        daemon=True,
-    )
-    worker.start()
+    if is_tp_rank_zero:
+        pbar = tqdm(total=len(my_samples), desc=f"CRUXEval-O [dp={dp_rank}]", position=dp_rank)
+        worker = threading.Thread(
+            target=run_eval_worker,
+            args=(my_samples, g, results, pbar, args.max_gen, exc_queue, done_event),
+            daemon=True,
+        )
+        worker.start()
+    else:
+        # Non-worker ranks signal done immediately so the work loop below
+        # starts calling g.stop() right away, allowing the stop handshake
+        # across both TP ranks to complete.
+        done_event.set()
 
-    # Drive FastGen on the main thread until the worker signals done via g.stop()
+    # Drive FastGen on the main thread. Once the worker is done, call
+    # g.stop() on every iteration — ImpGen requires repeated calls so that
+    # both TP ranks contribute to _stop_queue before rank 0 sends the None
+    # termination packet to unblock the FastGen generator.
     while True:
         done = g.work()
         if done:
             break
+        if done_event.is_set():
+            g.stop()
         try:
             exc = exc_queue.get_nowait()
             raise RuntimeError("Exception in eval worker") from exc
         except queue.Empty:
             pass
 
-    worker.join()
-    pbar.close()
+    if is_tp_rank_zero:
+        worker.join()
+        pbar.close()
 
     if not exc_queue.empty():
         raise RuntimeError("Exception in eval worker") from exc_queue.get()
 
-    # Write per-rank results
-    rank_results_path = dump_path / f"results_dp{dp_rank}.jsonl"
-    with rank_results_path.open("w") as f:
-        for r in results:
-            f.write(json.dumps(r) + "\n")
+    # Only TP rank 0 has results; TP rank 1 skips writing
+    if is_tp_rank_zero:
+        rank_results_path = dump_path / f"results_dp{dp_rank}.jsonl"
+        with rank_results_path.open("w") as f:
+            for r in results:
+                f.write(json.dumps(r) + "\n")
 
-    n_correct = sum(r["correct"] for r in results)
-    logger.info(
-        f"DP rank {dp_rank}: {n_correct}/{len(results)} correct "
-        f"({100 * n_correct / len(results):.1f}%)"
-    )
+        n_correct = sum(r["correct"] for r in results)
+        logger.info(
+            f"DP rank {dp_rank}: {n_correct}/{len(results)} correct "
+            f"({100 * n_correct / len(results):.1f}%)"
+        )
 
     torch.distributed.barrier()
 
