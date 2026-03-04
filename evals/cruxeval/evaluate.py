@@ -19,14 +19,11 @@ def extract_answer(generation: str, input: str) -> str | None:
         assert f(<input>) == <value>
         [/ANSWER]
 
-    Returns the predicted value as a string, or None if extraction fails.
-    Also filters out generations that just repeat the question (contain the
-    input call), matching the original CRUXEval evaluation logic.
+    We extract the value from the RHS of ==. The original CRUXEval benchmark
+    filters generations containing f({input}), but that filter is for models
+    that output bare values — it would incorrectly reject every CWM generation
+    since full assertions always contain the input call.
     """
-    # Filter out generations that repeat the question
-    if f"f({input})" in generation:
-        return None
-
     # Strip [ANSWER]/[/ANSWER] wrappers if present
     text = generation
     if "[ANSWER]" in text:
@@ -35,7 +32,7 @@ def extract_answer(generation: str, input: str) -> str | None:
         text = text.split("[/ANSWER]", 1)[0]
     text = text.strip()
 
-    # Extract value after == in an assert statement
+    # Extract value from the RHS of == in an assert statement
     match = re.search(r"==\s*(.+?)(?:\n|$)", text)
     if match:
         return match.group(1).strip()
