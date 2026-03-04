@@ -6,6 +6,8 @@ Mirrors the evaluation logic from the original CRUXEval benchmark:
 https://github.com/facebookresearch/cruxeval/blob/main/evaluation/utils_general.py
 """
 
+from __future__ import annotations
+
 import re
 import subprocess
 import sys
@@ -38,6 +40,12 @@ def extract_answer(generation: str, input: str) -> str | None:
         return match.group(1).strip()
 
     return None
+
+
+def extract_answer_reasoning(generation: str, input: str) -> str | None:
+    """Extract answer from a reasoning-mode generation (strips <think>...</think> blocks)."""
+    text = re.sub(r"<think>.*?</think>", "", generation, flags=re.DOTALL)
+    return extract_answer(text, input)
 
 
 def check_correct(

@@ -48,20 +48,28 @@ from cwm.fastgen.generate import FastGen
 from cwm.fastgen.utils.loading import build_fastgen_model, build_tokenizer_from_ckpt
 from cwm.rl.lib.impgen import ImpGen
 from evals.args import FastGenArgs, SetupArgs
-from evals.cruxeval.evaluate import check_correct, extract_answer
-from evals.cruxeval.prompts import make_direct_output_prompt
+from evals.cruxeval.evaluate import check_correct, extract_answer, extract_answer_reasoning
+from evals.cruxeval.prompts import make_direct_output_prompt, make_reasoning_prompt
 
 logger = logging.getLogger(__name__)
+
+
+_MAX_GEN: dict[str, int] = {
+    "direct": 512,
+    "reasoning": 4096,
+}
 
 
 @dataclass
 class CruxEvalArgs:
     checkpoint_dir: str = ""
     dump_dir: str = "eval-cwm-cruxeval"
+    # Evaluation mode: direct | reasoning
+    mode: str = "direct"
     # Number of samples to evaluate; -1 evaluates all 800
     n_samples: int = -1
-    # Max tokens to generate per sample
-    max_gen: int = 256
+    # Max tokens to generate per sample (0 = use mode default)
+    max_gen: int = 0
     seed: int = 42
     gen_args: FastGenArgs = field(
         default_factory=lambda: FastGenArgs(
@@ -103,6 +111,7 @@ def run_eval_worker(
     results: list[dict],
     pbar: tqdm,
     max_gen: int,
+    mode: str,
     exc_queue: queue.Queue,
     done_event: threading.Event,
 ) -> None:
@@ -114,20 +123,40 @@ def run_eval_worker(
     """
     try:
         for sample in samples:
-            prompt = make_direct_output_prompt(sample["code"], sample["input"])
-            tokens = g.tokenizer.encode(prompt, bos=True)
+            code = sample["code"]
+            inp = sample["input"]
 
-            packet = g.generate(
-                tokens=tokens,
-                max_gen=max_gen,
-                temperature=0.0,
-                stop_str="[/ANSWER]",
-            )
-            generation = g.tokenizer.decode(packet.tokens, cut_at_stop_tokens=False)
+            if mode == "direct":
+                prompt_tokens = g.tokenizer.encode(
+                    make_direct_output_prompt(code, inp), bos=True
+                )
+                packet = g.generate(
+                    tokens=prompt_tokens,
+                    max_gen=max_gen,
+                    temperature=0.0,
+                    stop_str="[/ANSWER]",
+                )
+                generation = g.tokenizer.decode(packet.tokens, cut_at_stop_tokens=False)
+                predicted = extract_answer(generation, inp)
 
-            predicted = extract_answer(generation, sample["input"])
+            elif mode == "reasoning":
+                prompt_tokens = g.tokenizer.encode(
+                    make_reasoning_prompt(code, inp), bos=True
+                )
+                packet = g.generate(
+                    tokens=prompt_tokens,
+                    max_gen=max_gen,
+                    temperature=0.0,
+                    stop_str="[/ANSWER]",
+                )
+                generation = g.tokenizer.decode(packet.tokens, cut_at_stop_tokens=False)
+                predicted = extract_answer_reasoning(generation, inp)
+
+            else:
+                raise ValueError(f"Unknown mode: {mode!r}")
+
             correct = (
-                check_correct(sample["code"], sample["output"], predicted)
+                check_correct(code, sample["output"], predicted)
                 if predicted is not None
                 else False
             )
@@ -135,6 +164,7 @@ def run_eval_worker(
             results.append(
                 {
                     "id": sample["id"],
+                    "mode": mode,
                     "generation": generation,
                     "predicted": predicted,
                     "expected": sample["output"],
@@ -204,11 +234,22 @@ def main(args: CruxEvalArgs) -> None:
     exc_queue: queue.Queue = queue.Queue()
     done_event = threading.Event()
 
+    effective_max_gen = args.max_gen if args.max_gen != 0 else _MAX_GEN[args.mode]
+
     if is_tp_rank_zero:
         pbar = tqdm(total=len(my_samples), desc=f"CRUXEval-O [dp={dp_rank}]", position=dp_rank)
         worker = threading.Thread(
             target=run_eval_worker,
-            args=(my_samples, g, results, pbar, args.max_gen, exc_queue, done_event),
+            args=(
+                my_samples,
+                g,
+                results,
+                pbar,
+                effective_max_gen,
+                args.mode,
+                exc_queue,
+                done_event,
+            ),
             daemon=True,
         )
         worker.start()
