@@ -49,7 +49,7 @@ from cwm.fastgen.utils.loading import build_fastgen_model, build_tokenizer_from_
 from cwm.rl.lib.impgen import ImpGen
 from evals.args import FastGenArgs, SetupArgs
 from evals.cruxeval.evaluate import check_correct, extract_answer, extract_answer_reasoning
-from evals.cruxeval.prompts import make_direct_output_prompt, make_reasoning_prompt
+from evals.cruxeval.prompts import make_direct_output_prompt, make_reasoning_prompt_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -140,9 +140,7 @@ def run_eval_worker(
                 predicted = extract_answer(generation, inp)
 
             elif mode == "reasoning":
-                prompt_tokens = g.tokenizer.encode(
-                    make_reasoning_prompt(code, inp), bos=True
-                )
+                prompt_tokens = make_reasoning_prompt_tokens(code, inp, g.tokenizer)
                 packet = g.generate(
                     tokens=prompt_tokens,
                     max_gen=max_gen,

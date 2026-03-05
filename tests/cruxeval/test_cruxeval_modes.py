@@ -16,8 +16,9 @@ from evals.cruxeval.evaluate import (
     extract_answer_reasoning,
 )
 from evals.cruxeval.prompts import (
+    REASONING_SYSTEM_PROMPT,
     make_direct_output_prompt,
-    make_reasoning_prompt,
+    make_reasoning_prompt_tokens,
 )
 
 # ---------------------------------------------------------------------------
@@ -75,17 +76,26 @@ def test_direct_prompt():
 # Tokenizer
 # ---------------------------------------------------------------------------
 
-def test_reasoning_prompt():
-    prompt = make_reasoning_prompt(CODE, INPUT)
-    direct = make_direct_output_prompt(CODE, INPUT)
-    pre_answer = direct[: -len("[ANSWER]\n")]
-    assert prompt == pre_answer + "<think>\n"
-
-
 @pytest.fixture
 def tokenizer(tokenizer_path):
     from cwm.text.tokenizers import build_tokenizer
     return build_tokenizer("cwm_instruct", tokenizer_path)
+
+
+def test_reasoning_prompt_tokens(tokenizer):
+    tokens = make_reasoning_prompt_tokens(CODE, INPUT, tokenizer)
+    decoded = tokenizer.decode(tokens, cut_at_stop_tokens=False)
+    # Check overall structure
+    assert decoded.startswith("<|begin_of_text|>")
+    assert REASONING_SYSTEM_PROMPT in decoded
+    # User message contains the CRUXEval question (without [ANSWER])
+    direct = make_direct_output_prompt(CODE, INPUT)
+    user_msg = direct[: -len("[ANSWER]\n")]
+    assert user_msg in decoded
+    # Prompt ends with assistant header + <think>\n
+    assert decoded.endswith("<|end_header_id|>\n\n<think>\n")
+    # Verify <think>\n is the correct token(s), not subworded due to BPE context
+    assert tokens[-len(tokenizer.think_token_ids):] == tokenizer.think_token_ids
 
 
 # ---------------------------------------------------------------------------
