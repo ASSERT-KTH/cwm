@@ -8,7 +8,7 @@
 #SBATCH -o logs/cruxeval_%j.out
 #SBATCH -e logs/cruxeval_%j.err
 
-MODE=direct
+MODE=${MODE:-direct}
 
 mkdir -p logs
 
