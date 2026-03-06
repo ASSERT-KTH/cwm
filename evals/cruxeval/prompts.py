@@ -51,6 +51,57 @@ assert f({input}) == ??
 """
 
 
+def _make_trace_context(code: str, input_str: str) -> str:
+    """Build the Python source context for trace prediction."""
+    return f"\n{code}\ndef main():  # << START_OF_TRACE\n    return f({input_str})\n"
+
+
+def make_trace_full_prompt_tokens(
+    code: str, input_str: str, tokenizer: "CWMInstructTokenizer"
+) -> list[int]:
+    """
+    Build a full-trace prompt.
+
+    Format:
+      [BOS][TRACE_CONTEXT_START]$CONTEXT[FRAME_SEP]
+      [CALL_SEP]{}[ACTION_SEP]def main():\\n[FRAME_SEP]
+
+    The model then generates the complete execution trace ending with [END_OF_TEXT].
+    """
+    context = _make_trace_context(code, input_str)
+    tokens = [tokenizer.bos_id, tokenizer.trace_context_start_id]
+    tokens += tokenizer.encode(context)
+    tokens += [tokenizer.frame_sep_id, tokenizer.call_sep_id]
+    tokens += tokenizer.encode("{}")
+    tokens += [tokenizer.action_sep_id]
+    tokens += tokenizer.encode("def main():\n")
+    tokens += [tokenizer.frame_sep_id]
+    return tokens
+
+
+def make_trace_single_step_prompt_tokens(
+    code: str, input_str: str, tokenizer: "CWMInstructTokenizer"
+) -> list[int]:
+    """
+    Build a single-step trace prompt.
+
+    Format:
+      [BOS][TRACE_CONTEXT_START]$CONTEXT[FRAME_SEP]
+      [CALL_SEP]{}\\n[ACTION_SEP]def main():\\n[FRAME_SEP][RETURN_SEP]
+
+    The model then generates: [ACTION_SEP] return f(...)[ARG_SEP]"value"[FRAME_SEP]
+    """
+    context = _make_trace_context(code, input_str)
+    tokens = [tokenizer.bos_id, tokenizer.trace_context_start_id]
+    tokens += tokenizer.encode(context)
+    tokens += [tokenizer.frame_sep_id, tokenizer.call_sep_id]
+    tokens += tokenizer.encode("{}")
+    tokens += [tokenizer.action_sep_id]
+    tokens += tokenizer.encode("def main():\n")
+    tokens += [tokenizer.frame_sep_id, tokenizer.return_sep_id]
+    return tokens
+
+
 def make_reasoning_prompt_tokens(
     code: str, input_str: str, tokenizer: "CWMInstructTokenizer"
 ) -> list[int]:

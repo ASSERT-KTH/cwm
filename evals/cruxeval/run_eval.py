@@ -48,8 +48,19 @@ from cwm.fastgen.generate import FastGen
 from cwm.fastgen.utils.loading import build_fastgen_model, build_tokenizer_from_ckpt
 from cwm.rl.lib.impgen import ImpGen
 from evals.args import FastGenArgs, SetupArgs
-from evals.cruxeval.evaluate import check_correct, extract_answer, extract_answer_reasoning
-from evals.cruxeval.prompts import make_direct_output_prompt, make_reasoning_prompt_tokens
+from evals.cruxeval.evaluate import (
+    check_correct,
+    extract_answer,
+    extract_answer_reasoning,
+    extract_answer_trace_full,
+    extract_answer_trace_single_step,
+)
+from evals.cruxeval.prompts import (
+    make_direct_output_prompt,
+    make_reasoning_prompt_tokens,
+    make_trace_full_prompt_tokens,
+    make_trace_single_step_prompt_tokens,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -57,6 +68,8 @@ logger = logging.getLogger(__name__)
 _MAX_GEN: dict[str, int] = {
     "direct": 512,
     "reasoning": 4096,
+    "trace_full": 2048,
+    "trace_single_step": 128,
 }
 
 
@@ -64,7 +77,7 @@ _MAX_GEN: dict[str, int] = {
 class CruxEvalArgs:
     checkpoint_dir: str = ""
     dump_dir: str = "eval-cwm-cruxeval"
-    # Evaluation mode: direct | reasoning
+    # Evaluation mode: direct | reasoning | trace_full | trace_single_step
     mode: str = "direct"
     # Number of samples to evaluate; -1 evaluates all 800
     n_samples: int = -1
@@ -149,6 +162,27 @@ def run_eval_worker(
                 )
                 generation = g.tokenizer.decode(packet.tokens, cut_at_stop_tokens=False)
                 predicted = extract_answer_reasoning(generation, inp)
+
+            elif mode == "trace_full":
+                prompt_tokens = make_trace_full_prompt_tokens(code, inp, g.tokenizer)
+                packet = g.generate(
+                    tokens=prompt_tokens,
+                    max_gen=max_gen,
+                    temperature=0.0,
+                )
+                generation = g.tokenizer.decode(packet.tokens, cut_at_stop_tokens=False)
+                predicted = extract_answer_trace_full(generation, inp)
+
+            elif mode == "trace_single_step":
+                prompt_tokens = make_trace_single_step_prompt_tokens(code, inp, g.tokenizer)
+                packet = g.generate(
+                    tokens=prompt_tokens,
+                    max_gen=max_gen,
+                    temperature=0.0,
+                    stop_str="<|frame_sep|>",
+                )
+                generation = g.tokenizer.decode(packet.tokens, cut_at_stop_tokens=False)
+                predicted = extract_answer_trace_single_step(generation, inp)
 
             else:
                 raise ValueError(f"Unknown mode: {mode!r}")

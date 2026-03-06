@@ -1,7 +1,7 @@
 #!/bin/bash
 #
 #SBATCH -J cwm-cruxeval
-#SBATCH -t 02:00:00
+#SBATCH -t 06:00:00
 #SBATCH -N 1
 #SBATCH --gpus=2
 #SBATCH -C "fat"

@@ -14,11 +14,15 @@ import pytest
 from evals.cruxeval.evaluate import (
     extract_answer,
     extract_answer_reasoning,
+    extract_answer_trace_full,
+    extract_answer_trace_single_step,
 )
 from evals.cruxeval.prompts import (
     REASONING_SYSTEM_PROMPT,
     make_direct_output_prompt,
     make_reasoning_prompt_tokens,
+    make_trace_full_prompt_tokens,
+    make_trace_single_step_prompt_tokens,
 )
 
 # ---------------------------------------------------------------------------
@@ -114,4 +118,61 @@ def test_extract_reasoning():
         'assert f("x9j") == "x9ja"\n[/ANSWER]'
     )
     assert extract_answer_reasoning(gen, INPUT) == '"x9ja"'
+
+
+def test_extract_trace_single_step():
+    # Model generates: [ACTION_SEP] return f("x9j")[ARG_SEP]"\"x9ja\""[FRAME_SEP]
+    gen = '<|action_sep|> return f("x9j")<|arg_sep|>"\\"x9ja\\""<|frame_sep|>'
+    assert extract_answer_trace_single_step(gen, INPUT) == '"x9ja"'
+
+
+def test_extract_trace_single_step_integer():
+    gen = "<|action_sep|> return f(17)<|arg_sep|>\"17\"<|frame_sep|>"
+    assert extract_answer_trace_single_step(gen, "17") == "17"
+
+
+def test_extract_trace_full():
+    # Full trace ends with the return of main(); there may be inner return frames.
+    gen = (
+        "<|line_sep|>{}<|action_sep|> return f(\"x9j\")\n<|frame_sep|>"
+        "<|return_sep|><|action_sep|> return f(\"x9j\")<|arg_sep|>\"\\\"x9ja\\\"\"<|frame_sep|>"
+        "<|return_sep|><|action_sep|> return f(\"x9j\")<|arg_sep|>\"\\\"x9ja\\\"\"<|frame_sep|>"
+        "<|end_of_text|>"
+    )
+    assert extract_answer_trace_full(gen, INPUT) == '"x9ja"'
+
+
+def test_extract_trace_full_no_return():
+    # Exception case — should return None
+    gen = "<|exception_sep|><|action_sep|> return f(\"x9j\")<|arg_sep|>\"ZeroDivisionError\"<|frame_sep|>"
+    assert extract_answer_trace_full(gen, INPUT) is None
+
+
+# ---------------------------------------------------------------------------
+# Trace prompt shape tests (tokenizer needed)
+# ---------------------------------------------------------------------------
+
+
+def test_trace_full_prompt_tokens(tokenizer):
+    tokens = make_trace_full_prompt_tokens(CODE, INPUT, tokenizer)
+    decoded = tokenizer.decode(tokens, cut_at_stop_tokens=False)
+    assert decoded.startswith("<|begin_of_text|><|trace_context_start|>")
+    assert "# << START_OF_TRACE" in decoded
+    assert f"return f({INPUT})" in decoded
+    assert decoded.endswith("<|frame_sep|>")
+    # Last frames: [CALL_SEP]{}[ACTION_SEP]def main():\n[FRAME_SEP]
+    assert "<|call_sep|>{}<|action_sep|>def main():\n<|frame_sep|>" in decoded
+    print("\n" + decoded)
+
+
+def test_trace_single_step_prompt_tokens(tokenizer):
+    tokens = make_trace_single_step_prompt_tokens(CODE, INPUT, tokenizer)
+    decoded = tokenizer.decode(tokens, cut_at_stop_tokens=False)
+    assert decoded.startswith("<|begin_of_text|><|trace_context_start|>")
+    assert "# << START_OF_TRACE" in decoded
+    assert f"return f({INPUT})" in decoded
+    assert decoded.endswith("<|return_sep|>")
+    # Last frames: [CALL_SEP]{}\n[ACTION_SEP]def main():\n[FRAME_SEP][RETURN_SEP]
+    assert "<|call_sep|>{}<|action_sep|>def main():\n<|frame_sep|><|return_sep|>" in decoded
+    print("\n" + decoded)
 
