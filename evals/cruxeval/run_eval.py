@@ -67,9 +67,9 @@ logger = logging.getLogger(__name__)
 
 _MAX_GEN: dict[str, int] = {
     "direct": 512,
-    "reasoning": 4096,
-    "trace_full": 2048,
-    "trace_single_step": 128,
+    "reasoning": 8192,
+    "trace_full": 8192,
+    "trace_single_step": 512,
 }
 
 
