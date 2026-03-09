@@ -83,12 +83,15 @@ class CruxEvalArgs:
     n_samples: int = -1
     # Max tokens to generate per sample (0 = use mode default)
     max_gen: int = 0
+    # Number of generations per sample for pass@1 estimation
+    n_generations: int = 10
     seed: int = 42
     gen_args: FastGenArgs = field(
         default_factory=lambda: FastGenArgs(
             tp_size=2,
-            use_sampling=False,
-            temperature=0.0,
+            use_sampling=True,
+            temperature=0.6,
+            top_p=0.95,
         )
     )
     setup: SetupArgs = field(default_factory=SetupArgs)
@@ -125,6 +128,9 @@ def run_eval_worker(
     pbar: tqdm,
     max_gen: int,
     mode: str,
+    n_generations: int,
+    temperature: float,
+    top_p: float,
     exc_queue: queue.Queue,
     done_event: threading.Event,
 ) -> None:
@@ -143,64 +149,43 @@ def run_eval_worker(
                 prompt_tokens = g.tokenizer.encode(
                     make_direct_output_prompt(code, inp), bos=True
                 )
-                packet = g.generate(
-                    tokens=prompt_tokens,
-                    max_gen=max_gen,
-                    temperature=0.0,
-                    stop_str="[/ANSWER]",
-                )
-                generation = g.tokenizer.decode(packet.tokens, cut_at_stop_tokens=False)
-                predicted = extract_answer(generation, inp)
-
+                gen_kwargs = dict(max_gen=max_gen, temperature=temperature, top_p=top_p, stop_str="[/ANSWER]")
+                extract_fn = lambda gen: extract_answer(gen, inp)
             elif mode == "reasoning":
                 prompt_tokens = make_reasoning_prompt_tokens(code, inp, g.tokenizer)
-                packet = g.generate(
-                    tokens=prompt_tokens,
-                    max_gen=max_gen,
-                    temperature=0.0,
-                    stop_str="[/ANSWER]",
-                )
-                generation = g.tokenizer.decode(packet.tokens, cut_at_stop_tokens=False)
-                predicted = extract_answer_reasoning(generation, inp)
-
+                gen_kwargs = dict(max_gen=max_gen, temperature=temperature, top_p=top_p, stop_str="[/ANSWER]")
+                extract_fn = lambda gen: extract_answer_reasoning(gen, inp)
             elif mode == "trace_full":
                 prompt_tokens = make_trace_full_prompt_tokens(code, inp, g.tokenizer)
-                packet = g.generate(
-                    tokens=prompt_tokens,
-                    max_gen=max_gen,
-                    temperature=0.0,
-                )
-                generation = g.tokenizer.decode(packet.tokens, cut_at_stop_tokens=False)
-                predicted = extract_answer_trace_full(generation, inp)
-
+                gen_kwargs = dict(max_gen=max_gen, temperature=temperature, top_p=top_p)
+                extract_fn = lambda gen: extract_answer_trace_full(gen, inp)
             elif mode == "trace_single_step":
                 prompt_tokens = make_trace_single_step_prompt_tokens(code, inp, g.tokenizer)
-                packet = g.generate(
-                    tokens=prompt_tokens,
-                    max_gen=max_gen,
-                    temperature=0.0,
-                    stop_str="<|frame_sep|>",
-                )
-                generation = g.tokenizer.decode(packet.tokens, cut_at_stop_tokens=False)
-                predicted = extract_answer_trace_single_step(generation, inp)
-
+                gen_kwargs = dict(max_gen=max_gen, temperature=temperature, top_p=top_p, stop_str="<|frame_sep|>")
+                extract_fn = lambda gen: extract_answer_trace_single_step(gen, inp)
             else:
                 raise ValueError(f"Unknown mode: {mode!r}")
 
-            correct = (
-                check_correct(code, sample["output"], predicted)
-                if predicted is not None
-                else False
-            )
+            gens = []
+            for _ in range(n_generations):
+                packet = g.generate(tokens=prompt_tokens, **gen_kwargs)
+                generation = g.tokenizer.decode(packet.tokens, cut_at_stop_tokens=False)
+                predicted = extract_fn(generation)
+                correct = (
+                    check_correct(code, sample["output"], predicted)
+                    if predicted is not None
+                    else False
+                )
+                gens.append({"generation": generation, "predicted": predicted, "correct": correct})
 
+            n_correct = sum(g["correct"] for g in gens)
             results.append(
                 {
                     "id": sample["id"],
                     "mode": mode,
-                    "generation": generation,
-                    "predicted": predicted,
                     "expected": sample["output"],
-                    "correct": correct,
+                    "pass_at_1": n_correct / n_generations,
+                    "generations": gens,
                 }
             )
             pbar.update(1)
@@ -279,6 +264,9 @@ def main(args: CruxEvalArgs) -> None:
                 pbar,
                 effective_max_gen,
                 args.mode,
+                args.n_generations,
+                args.gen_args.temperature,
+                args.gen_args.top_p,
                 exc_queue,
                 done_event,
             ),
@@ -321,10 +309,9 @@ def main(args: CruxEvalArgs) -> None:
             for r in results:
                 f.write(json.dumps(r) + "\n")
 
-        n_correct = sum(r["correct"] for r in results)
+        rank_pass_at_1 = sum(r["pass_at_1"] for r in results) / len(results)
         logger.info(
-            f"DP rank {dp_rank}: {n_correct}/{len(results)} correct "
-            f"({100 * n_correct / len(results):.1f}%)"
+            f"DP rank {dp_rank}: pass@1={rank_pass_at_1:.4f} over {len(results)} samples"
         )
 
     torch.distributed.barrier()
@@ -341,9 +328,8 @@ def main(args: CruxEvalArgs) -> None:
         id_to_idx = {s["id"]: i for i, s in enumerate(dataset)}
         all_results.sort(key=lambda r: id_to_idx.get(r["id"], 0))
 
-        total_correct = sum(r["correct"] for r in all_results)
-        pass_at_1 = total_correct / len(all_results)
-        print(f"\nCRUXEval-O pass@1: {pass_at_1:.4f} ({total_correct}/{len(all_results)})")
+        pass_at_1 = sum(r["pass_at_1"] for r in all_results) / len(all_results)
+        print(f"\nCRUXEval-O pass@1: {pass_at_1:.4f} (n={len(all_results)}, {args.n_generations} gens each)")
 
         with (dump_path / "results.jsonl").open("w") as f:
             for r in all_results:
@@ -351,8 +337,10 @@ def main(args: CruxEvalArgs) -> None:
 
         summary = {
             "pass_at_1": pass_at_1,
-            "n_correct": total_correct,
             "n_total": len(all_results),
+            "n_generations": args.n_generations,
+            "temperature": args.gen_args.temperature,
+            "top_p": args.gen_args.top_p,
         }
         with (dump_path / "summary.json").open("w") as f:
             json.dump(summary, f, indent=2)
