@@ -94,7 +94,9 @@ class CruxEvalArgs:
             top_p=0.95,
         )
     )
-    setup: SetupArgs = field(default_factory=SetupArgs)
+    setup: SetupArgs = field(
+        default_factory=lambda: SetupArgs(torch_init_timeout=7200)
+    )
 
 
 def setup_mesh(args: CruxEvalArgs) -> tuple[DeviceMesh, torch.distributed.ProcessGroup]:
