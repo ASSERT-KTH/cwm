@@ -9,7 +9,7 @@
 
 mkdir -p logs
 
-module load Miniforge3/24.7.1-2-hpc1-bdist
-mamba activate CWM
+
+
 
 pytest tests/interp/ -v --tb=short

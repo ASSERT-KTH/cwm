@@ -117,13 +117,45 @@ def setup_mesh(args: SteeringArgs) -> tuple[DeviceMesh, torch.distributed.Proces
     return world_mesh, tp_group
 
 
+def _prepare_samples(samples: list[dict], g: ImpGen, mode: str) -> list[dict]:
+    """Pre-tokenise all samples so there is no Python overhead inside the generation loop."""
+    prepared = []
+    for sample in samples:
+        code = sample["code"]
+        inp = sample["input"]
+        if mode == "direct":
+            prompt_tokens = g.tokenizer.encode(
+                make_direct_output_prompt(code, inp), bos=True
+            )
+            extract_fn = lambda gen, inp=inp: extract_answer(gen, inp)
+            stop_str = "[/ANSWER]"
+        elif mode == "trace_full":
+            prompt_tokens = make_trace_full_prompt_tokens(code, inp, g.tokenizer)
+            extract_fn = lambda gen, inp=inp: extract_answer_trace_full(gen, inp)
+            stop_str = None
+        elif mode == "trace_single_step":
+            prompt_tokens = make_trace_single_step_prompt_tokens(code, inp, g.tokenizer)
+            extract_fn = lambda gen, inp=inp: extract_answer_trace_single_step(gen, inp)
+            stop_str = "<|frame_sep|>"
+        else:
+            raise ValueError(f"Unknown mode: {mode!r}")
+        prepared.append(
+            {
+                "sample": sample,
+                "prompt_tokens": prompt_tokens,
+                "extract_fn": extract_fn,
+                "stop_str": stop_str,
+            }
+        )
+    return prepared
+
+
 def run_steer_worker(
-    samples: list[dict],
+    prepared: list[dict],
     g: ImpGen,
     layer: int,
     alpha: float,
     vector: torch.Tensor,
-    mode: str,
     max_gen: int,
     results: list[dict],
     pbar: tqdm,
@@ -131,40 +163,25 @@ def run_steer_worker(
     done_event: threading.Event,
 ) -> None:
     hook = SteeringHook(layer=layer, vector=vector, alpha=alpha, position="all")
+    steering_hooks = [hook] if alpha != 0.0 else []
     try:
-        for sample in samples:
-            code = sample["code"]
-            inp = sample["input"]
-
-            if mode == "direct":
-                prompt_tokens = g.tokenizer.encode(
-                    make_direct_output_prompt(code, inp), bos=True
-                )
-                extract_fn = lambda gen: extract_answer(gen, inp)
-                stop_str = "[/ANSWER]"
-            elif mode == "trace_full":
-                prompt_tokens = make_trace_full_prompt_tokens(code, inp, g.tokenizer)
-                extract_fn = lambda gen: extract_answer_trace_full(gen, inp)
-                stop_str = None
-            elif mode == "trace_single_step":
-                prompt_tokens = make_trace_single_step_prompt_tokens(code, inp, g.tokenizer)
-                extract_fn = lambda gen: extract_answer_trace_single_step(gen, inp)
-                stop_str = "<|frame_sep|>"
-            else:
-                raise ValueError(f"Unknown mode: {mode!r}")
+        for item in prepared:
+            sample = item["sample"]
+            prompt_tokens = item["prompt_tokens"]
+            extract_fn = item["extract_fn"]
+            stop_str = item["stop_str"]
 
             gen_kwargs: dict = dict(max_gen=max_gen)
             if stop_str:
                 gen_kwargs["stop_str"] = stop_str
 
-            steering_hooks = [hook] if alpha != 0.0 else []
             with activation_hook_context(steering_hooks=steering_hooks):
                 packet = g.generate(tokens=prompt_tokens, **gen_kwargs)
 
             generation = g.tokenizer.decode(packet.tokens, cut_at_stop_tokens=False)
             predicted = extract_fn(generation)
             correct = (
-                check_correct(code, sample["output"], predicted)
+                check_correct(sample["code"], sample["output"], predicted)
                 if predicted is not None
                 else False
             )
@@ -187,12 +204,11 @@ def run_steer_worker(
 
 
 def _run_one_sweep(
-    samples: list[dict],
+    prepared: list[dict],
     g: ImpGen,
     layer: int,
     alpha: float,
     vector: torch.Tensor,
-    mode: str,
     max_gen: int,
     dp_rank: int,
 ) -> list[dict]:
@@ -203,7 +219,7 @@ def _run_one_sweep(
 
     if is_tp_rank_zero:
         pbar = tqdm(
-            total=len(samples),
+            total=len(prepared),
             desc=f"Steer layer={layer} α={alpha:.2f} [dp={dp_rank}]",
             position=dp_rank,
             leave=False,
@@ -211,12 +227,11 @@ def _run_one_sweep(
         worker = threading.Thread(
             target=run_steer_worker,
             args=(
-                samples,
+                prepared,
                 g,
                 layer,
                 alpha,
                 vector,
-                mode,
                 max_gen,
                 results,
                 pbar,
@@ -324,7 +339,6 @@ def main(args: SteeringArgs) -> None:
             tp_mesh=world_mesh["tp"],
         )
         torch.cuda.empty_cache()
-        g = ImpGen(fg, tp_group.rank(), tp_group)
 
         dataset = list(load_dataset("cruxeval-org/cruxeval", split="test"))
         if args.n_samples > 0:
@@ -339,6 +353,12 @@ def main(args: SteeringArgs) -> None:
         max_gen = _MAX_GEN.get(args.mode, 4096)
         all_sweep_results: list[dict] = []
 
+        # Pre-tokenise once using a temporary ImpGen (tokenizer only, no generation)
+        g_tmp = ImpGen(fg, tp_group.rank(), tp_group)
+        if g_tmp.tp_rank == 0:
+            logger.info("Pre-tokenising %d samples ...", len(my_samples))
+        prepared_samples = _prepare_samples(my_samples, g_tmp, args.mode)
+
         for layer in args.target_layers:
             vec = vectors.get(layer)
             if vec is None:
@@ -346,8 +366,10 @@ def main(args: SteeringArgs) -> None:
                 continue
 
             for alpha in args.alphas:
+                # Fresh ImpGen per combo — avoids in-flight assertion on reuse
+                g = ImpGen(fg, tp_group.rank(), tp_group)
                 results = _run_one_sweep(
-                    my_samples, g, layer, alpha, vec, args.mode, max_gen, dp_rank
+                    prepared_samples, g, layer, alpha, vec, max_gen, dp_rank
                 )
                 if g.tp_rank == 0:
                     all_sweep_results.extend(results)

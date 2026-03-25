@@ -84,7 +84,7 @@ class CruxEvalArgs:
     # Max tokens to generate per sample (0 = use mode default)
     max_gen: int = 0
     # Number of generations per sample for pass@1 estimation
-    n_generations: int = 10
+    n_generations: int = 1
     seed: int = 42
     gen_args: FastGenArgs = field(
         default_factory=lambda: FastGenArgs(

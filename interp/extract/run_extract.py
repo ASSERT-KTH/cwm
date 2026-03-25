@@ -57,8 +57,23 @@ from interp.extract.hooks import (
 
 logger = logging.getLogger(__name__)
 
-# Trace separator token IDs
-_TRACE_TOKEN_IDS = [100, 101, 102, 103, 104, 105, 106, 107]
+# Trace separator token IDs — derived at runtime from the tokenizer
+# (see _build_trace_token_ids). Placeholder here for backward compat.
+_TRACE_TOKEN_IDS: list[int] = []
+
+
+def _build_trace_token_ids(tokenizer) -> list[int]:
+    """Return actual vocab IDs for the 8 trace separator tokens."""
+    return [
+        tokenizer.frame_sep_id,
+        tokenizer.action_sep_id,
+        tokenizer.return_sep_id,
+        tokenizer.call_sep_id,
+        tokenizer.line_sep_id,
+        tokenizer.exception_sep_id,
+        tokenizer.arg_sep_id,
+        tokenizer.trace_context_start_id,
+    ]
 
 _MAX_GEN: dict[str, int] = {
     "direct": 512,
@@ -136,9 +151,9 @@ def _make_prompt_and_extract_fn(mode: str, sample: dict, g: ImpGen):
     return prompt_tokens, extract_fn, stop_str
 
 
-def _capture_token_ids_for(capture_at: str) -> list[int] | None:
+def _capture_token_ids_for(capture_at: str, trace_token_ids: list[int]) -> list[int] | None:
     if capture_at == "trace_tokens":
-        return _TRACE_TOKEN_IDS
+        return trace_token_ids
     elif capture_at == "all":
         return None
     elif capture_at == "last":
@@ -154,15 +169,28 @@ def run_extract_worker(
     max_gen: int,
     mode: str,
     capture_at: str,
+    trace_token_ids: list[int],
     layers: list[int],
     dump_dir: Path,
     exc_queue: queue.Queue,
     done_event: threading.Event,
 ) -> None:
-    capture_ids = _capture_token_ids_for(capture_at)
+    capture_ids = _capture_token_ids_for(capture_at, trace_token_ids)
 
     try:
         for sample in samples:
+            act_path = dump_dir / "activations" / f"{sample['id']}.pt"
+            if act_path.exists():
+                # Rebuild index entry from existing file so index.jsonl stays complete
+                try:
+                    existing = torch.load(act_path, map_location="cpu", weights_only=False)
+                    index_entry = {k: v for k, v in existing.items() if k != "activations"}
+                    results.append(index_entry)
+                except Exception as e:
+                    logger.warning(f"Could not load index for existing {act_path}: {e}")
+                pbar.update(1)
+                continue
+
             prompt_tokens, extract_fn, stop_str = _make_prompt_and_extract_fn(
                 mode, sample, g
             )
@@ -208,7 +236,6 @@ def run_extract_worker(
                 "activations": activations,
             }
 
-            act_path = dump_dir / "activations" / f"{sample['id']}.pt"
             torch.save(sample_data, act_path)
 
             # Index entry (no activations tensor)
@@ -256,6 +283,9 @@ def main(args: ExtractArgs) -> None:
         torch.cuda.empty_cache()
         g = ImpGen(fg, tp_group.rank(), tp_group)
 
+        trace_token_ids = _build_trace_token_ids(tokenizer)
+        logger.info(f"Trace token IDs: {trace_token_ids}")
+
         dataset = list(load_dataset("cruxeval-org/cruxeval", split="test"))
         if args.n_samples > 0:
             dataset = dataset[: args.n_samples]
@@ -295,6 +325,7 @@ def main(args: ExtractArgs) -> None:
                     effective_max_gen,
                     args.mode,
                     args.capture_at,
+                    trace_token_ids,
                     args.layers,
                     dump_path,
                     exc_queue,

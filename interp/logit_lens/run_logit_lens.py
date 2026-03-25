@@ -31,38 +31,80 @@ def _load_norm_and_output(checkpoint_dir: str):
     """Load only the final RMSNorm weights and output head from the checkpoint.
 
     Returns (norm_weight, output_weight, eps).
+    Supports both legacy .pth format and DCP (.distcp) format.
     """
-    import os
-
     ckpt_path = Path(checkpoint_dir)
-    # Try to load consolidated checkpoint; fall back to shards
+    norm_weight = None
+    output_weight = None
+
+    # Try legacy .pth format first
     pt_files = sorted(ckpt_path.glob("consolidated*.pth")) or sorted(
         ckpt_path.glob("*.pth")
     )
-    if not pt_files:
-        raise FileNotFoundError(f"No .pth files found in {checkpoint_dir}")
+    if pt_files:
+        for pf in pt_files:
+            try:
+                state = torch.load(pf, map_location="cpu", weights_only=True)
+                if isinstance(state, dict):
+                    if "model" in state:
+                        state = state["model"]
+                    if norm_weight is None and "norm.weight" in state:
+                        norm_weight = state["norm.weight"].float()
+                    if output_weight is None and "output.weight" in state:
+                        output_weight = state["output.weight"].float()
+                    if output_weight is None and "tok_embeddings.weight" in state:
+                        output_weight = state["tok_embeddings.weight"].float()
+            except Exception as e:
+                logger.warning(f"Could not load {pf}: {e}")
+            if norm_weight is not None and output_weight is not None:
+                break
 
-    # Load norm.weight and output.weight only from first shard (or consolidated)
-    norm_weight = None
-    output_weight = None
-    for pf in pt_files:
+    # Fall back to DCP (.distcp) format
+    if (norm_weight is None or output_weight is None) and list(
+        ckpt_path.glob("*.distcp")
+    ):
         try:
-            state = torch.load(pf, map_location="cpu", weights_only=True)
-            if isinstance(state, dict):
-                # handle {"model": {...}} wrapper
-                if "model" in state:
-                    state = state["model"]
-                if norm_weight is None and "norm.weight" in state:
-                    norm_weight = state["norm.weight"].float()
-                if output_weight is None and "output.weight" in state:
-                    output_weight = state["output.weight"].float()
-                if output_weight is None and "tok_embeddings.weight" in state:
-                    # tied embeddings
-                    output_weight = state["tok_embeddings.weight"].float()
+            import torch.distributed.checkpoint as dcp
+            from torch.distributed.checkpoint._fsspec_filesystem import FsspecReader
+            from upath import UPath
+
+            reader = FsspecReader(UPath(checkpoint_dir))
+            metadata = reader.read_metadata()
+            keys = set(metadata.state_dict_metadata.keys())
+
+            norm_key = next(
+                (k for k in ("model.norm.weight", "norm.weight") if k in keys), None
+            )
+            output_key = next(
+                (
+                    k
+                    for k in (
+                        "model.output.weight",
+                        "output.weight",
+                        "model.tok_embeddings.weight",
+                        "tok_embeddings.weight",
+                    )
+                    if k in keys
+                ),
+                None,
+            )
+
+            load_dict = {}
+            if norm_key:
+                norm_meta = metadata.state_dict_metadata[norm_key]
+                load_dict[norm_key] = torch.zeros(norm_meta.size, dtype=torch.float32)
+            if output_key:
+                out_meta = metadata.state_dict_metadata[output_key]
+                load_dict[output_key] = torch.zeros(out_meta.size, dtype=torch.float32)
+
+            if load_dict:
+                dcp.load(load_dict, storage_reader=reader)
+                if norm_key and norm_weight is None:
+                    norm_weight = load_dict[norm_key].float()
+                if output_key and output_weight is None:
+                    output_weight = load_dict[output_key].float()
         except Exception as e:
-            logger.warning(f"Could not load {pf}: {e}")
-        if norm_weight is not None and output_weight is not None:
-            break
+            logger.warning(f"Could not load DCP checkpoint: {e}")
 
     if norm_weight is None or output_weight is None:
         raise RuntimeError(

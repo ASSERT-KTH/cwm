@@ -12,8 +12,8 @@ EXTRACT_DIR=${EXTRACT_DIR:-./interp-extract-trace_full}
 
 mkdir -p logs
 
-module load Miniforge3/24.7.1-2-hpc1-bdist
-mamba activate CWM
+
+
 
 # Train all property × probe_type combinations
 for prop in will_be_correct return_type return_sign return_truthy; do

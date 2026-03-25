@@ -64,3 +64,13 @@ docs/_sources
 # Ultimate logs
 Ultimate.log
 UltimateCounterExample.errorpath
+
+# Experiment outputs (large data/model artifacts — not versioned)
+eval-cwm-*/
+interp-extract-*/
+interp-intervene-*/
+interp-steer-*/
+interp-bug-*/
+model_weights/
+logs/
+report.txt

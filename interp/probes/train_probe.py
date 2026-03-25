@@ -90,7 +90,7 @@ def train_one_layer(
         probe.train()
         total_loss, total_correct, total_n = 0.0, 0, 0
         for x, y in train_loader:
-            x, y = x.to(device), y.to(device)
+            x, y = x.to(device=device, dtype=torch.float32), y.to(device)
             logits = probe(x)
             loss = criterion(logits, y)
             optimizer.zero_grad()
@@ -104,7 +104,7 @@ def train_one_layer(
         val_correct, val_n = 0, 0
         with torch.no_grad():
             for x, y in val_loader:
-                x, y = x.to(device), y.to(device)
+                x, y = x.to(device=device, dtype=torch.float32), y.to(device)
                 logits = probe(x)
                 val_correct += (logits.argmax(-1) == y).sum().item()
                 val_n += len(y)

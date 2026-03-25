@@ -12,9 +12,9 @@ EXTRACT_DIR=${EXTRACT_DIR:-./interp-extract-trace_full}
 
 mkdir -p logs
 
-module load Miniforge3/24.7.1-2-hpc1-bdist
-mamba activate CWM
 
-python -m interp.logit_lens.run_logit_lens \
+
+
+/proj/assert-berzelius/users/x_andaf/.conda/envs/CWM/bin/python -m interp.logit_lens.run_logit_lens \
     extract_dir=${EXTRACT_DIR} \
     checkpoint_dir=./model_weights/cwm

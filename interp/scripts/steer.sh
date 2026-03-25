@@ -13,10 +13,10 @@ CONDITION=${CONDITION:-correct_vs_incorrect}
 
 mkdir -p logs
 
-module load Miniforge3/24.7.1-2-hpc1-bdist
-mamba activate CWM
 
-python -m torch.distributed.run --nproc_per_node=8 \
+
+
+/proj/assert-berzelius/users/x_andaf/.conda/envs/CWM/bin/python -m torch.distributed.run --nproc_per_node=8 \
     -m interp.steering.run_steering \
     checkpoint_dir=./model_weights/cwm \
     dump_dir=./interp-steer-${CONDITION} \
