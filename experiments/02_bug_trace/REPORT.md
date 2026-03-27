@@ -67,27 +67,27 @@ experimental handles:
 **Source**: 800 CRUXEval programs (HuggingFace: `cruxeval-org/cruxeval`).
 
 **Mutation types applied**:
-| Mutation | Description | Example | Count |
-|----------|-------------|---------|-------|
-| `condition_flip` | Negate if/while condition | `if x:` → `if not x:` | 288 |
-| `off_by_one_minus` | Integer constants -1 | `range(n)` → `range(n-1)` | 176 |
-| `off_by_one_plus` | Integer constants +1 | `range(n)` → `range(n+1)` | 170 |
-| `wrong_comparator` | Swap comparison op | `a < b` → `a <= b` | 115 |
-| `wrong_operator` | Swap arithmetic op | `a + b` → `a - b` | 81 |
-| **Total** | | | **830** |
+| Mutation | Description | Example | Count | % |
+|----------|-------------|---------|-------|---|
+| `condition_flip` | Negate if/while condition | `if x:` → `if not x:` | 288 | 34.7% |
+| `off_by_one_minus` | Integer constants -1 | `range(n)` → `range(n-1)` | 176 | 21.2% |
+| `off_by_one_plus` | Integer constants +1 | `range(n)` → `range(n+1)` | 170 | 20.5% |
+| `wrong_comparator` | Swap comparison op | `a < b` → `a <= b` | 115 | 13.9% |
+| `wrong_operator` | Swap arithmetic op | `a + b` → `a - b` | 81 | 9.8% |
+| **Total** | | | **830** | **100%** |
 
 **Validity filter**: only mutations where the output changes (verified by
 execution with 5s timeout). Up to 3 mutations per original program.
 
-**Final dataset**: 830 (buggy, original) pairs from 800 CRUXEval programs.
-Total samples for extraction: ~1200–1300 (originals deduplicated, ~600 unique
-originals each paired with ~1.4 buggy variants on average).
+**Final dataset**: 830 (buggy, original) pairs from 450 unique CRUXEval programs.
+Total samples for extraction: **1280** (450 unique originals + 830 buggy variants,
+average 1.84 buggy variants per original program).
 
-**Statistics**: *(fill in after `mutate.py` runs)*
-- Total original programs: X
-- Total mutation pairs: X
-- Pairs by mutation type: X / X / X / X / X
-- % mutations that changed output: X%
+**Statistics**:
+- Total original programs used: 450 (out of 800 CRUXEval; 350 had no valid mutations)
+- Total mutation pairs: 830
+- Pairs by mutation type: condition_flip 288, off_by_one_minus 176, off_by_one_plus 170, wrong_comparator 115, wrong_operator 81
+- All 830 pairs verified to change the program output (validity filter applied during mutation)
 
 **Dataset file**: `interp/bug_trace/data/pairs.json`
 
