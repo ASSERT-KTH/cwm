@@ -7,7 +7,7 @@ hypothesis, reproduction commands, results, interpretation) and optionally a `PL
 | # | Experiment | Status | Key finding |
 |---|------------|--------|-------------|
 | [01](01_interp_cruxeval/) | Interp on CRUXEval (trace_full) | ✅ Complete | `return_type` linearly decodable +34pp at layer 32; steering +2pp (underpowered) |
-| [02](02_bug_trace/) | Bug-fixing representation tracing | ⏳ Running | Extraction job pending (SLURM 15901326) |
+| [02](02_bug_trace/) | Bug-fixing representation tracing | ✅ Complete | Layer 32 CCS direction causally improves bug-fix pass@1 by +16.7 pp (53%→70%); `will_be_correct` 79%→92% over generation |
 
 ## Code
 

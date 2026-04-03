@@ -41,7 +41,7 @@ def _get_matplotlib():
         matplotlib.use("Agg")
         import matplotlib.pyplot as plt
         return plt
-    except ImportError:
+    except Exception:
         logger.warning("matplotlib not available; skipping plots")
         return None
 
