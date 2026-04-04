@@ -193,6 +193,113 @@ def plot_change_point_hist(traj_path: Path, layers: list[int], method: str, dpi:
     logger.info(f"Saved change point histogram to {out}")
 
 
+def plot_probe_content_heatmap(traj_path: Path, layers: list[int], dpi: int) -> None:
+    plt = _get_matplotlib()
+    if plt is None:
+        return
+    probe_path = traj_path / "probe_content_mutation_type.pt"
+    if not probe_path.exists():
+        logger.warning(f"No probe_content results at {probe_path}")
+        return
+
+    data = torch.load(probe_path, map_location="cpu", weights_only=False)
+    heatmap = data["heatmap"]
+    mutation_types = data.get("mutation_types", [])
+    majority_bl = data.get("majority_baseline", 0.35)
+    random_bl = data.get("random_baseline", 0.2)
+    args_d = data.get("args", {})
+    n_bins = args_d.get("n_time_bins", 10)
+
+    import numpy as np
+    grid = np.full((len(layers), n_bins), float("nan"))
+    perm_bls = []
+    for li, layer in enumerate(layers):
+        perm_bls.append(heatmap.get(layer, {}).get("perm_baseline", float("nan")))
+        for b in range(n_bins):
+            val = heatmap.get(layer, {}).get(b, {}).get("val_acc", float("nan"))
+            grid[li, b] = val
+
+    fig, ax = plt.subplots(figsize=(10, 4))
+    im = ax.imshow(grid, aspect="auto", vmin=0.1, vmax=0.8, cmap="RdYlGn")
+    ax.set_yticks(range(len(layers)))
+    ax.set_yticklabels([str(l) for l in layers])
+    ax.set_xticks(range(n_bins))
+    ax.set_xticklabels([f"{(b+0.5)/n_bins:.1f}" for b in range(n_bins)], rotation=45, ha="right")
+    ax.set_xlabel("Relative time in generation (0=start, 1=end)")
+    ax.set_ylabel("Layer")
+    title = (
+        f"mutation_type probe ({len(mutation_types)}-class) — T × L heatmap\n"
+        f"random={random_bl:.2f}  majority={majority_bl:.2f}  "
+        f"perm_bl={[f'{p:.2f}' for p in perm_bls]}"
+    )
+    ax.set_title(title, fontsize=8)
+    plt.colorbar(im, ax=ax, label="Val accuracy")
+    plt.tight_layout()
+    out = traj_path / "figures" / "probe_heatmap_mutation_type.png"
+    out.parent.mkdir(exist_ok=True)
+    plt.savefig(out, dpi=dpi)
+    plt.close()
+    logger.info(f"Saved mutation_type probe heatmap to {out}")
+
+
+def plot_pca_mutation_type(traj_path: Path, layer: int, n_examples: int, dpi: int) -> None:
+    """PCA scatter colored by mutation_type (first decode step only)."""
+    plt = _get_matplotlib()
+    if plt is None:
+        return
+    pca_path = traj_path / "pca_trajectory.pt"
+    if not pca_path.exists():
+        return
+
+    data = torch.load(pca_path, map_location="cpu", weights_only=False)
+    layer_data = data.get(layer)
+    if layer_data is None:
+        return
+
+    traj_projs = layer_data.get("traj_projections", [])
+    if not traj_projs:
+        return
+
+    import numpy as np
+
+    mutation_colors = {
+        "condition_flip": "#E91E63",
+        "off_by_one_minus": "#FF9800",
+        "off_by_one_plus": "#FFC107",
+        "wrong_comparator": "#9C27B0",
+        "wrong_operator": "#00BCD4",
+        "none": "#9E9E9E",
+    }
+
+    fig, ax = plt.subplots(figsize=(8, 8))
+    seen_types: set = set()
+    for item in traj_projs:
+        proj = np.array(item["proj"])  # [T, 2]
+        if proj.shape[0] < 1:
+            continue
+        mt = item.get("mutation_type", "none") or "none"
+        color = mutation_colors.get(mt, "#9E9E9E")
+        # Plot only first step as a scatter point
+        ax.scatter(proj[0, 0], proj[0, 1], c=color, s=8, alpha=0.5, label=(mt if mt not in seen_types else ""))
+        seen_types.add(mt)
+
+    from matplotlib.lines import Line2D
+    legend = [
+        Line2D([0], [0], marker="o", color="w", markerfacecolor=col, markersize=8, label=mt)
+        for mt, col in mutation_colors.items() if mt in seen_types
+    ]
+    ax.legend(handles=legend, fontsize=8)
+    ax.set_xlabel("PC1")
+    ax.set_ylabel("PC2")
+    ax.set_title(f"PCA scatter by mutation_type (layer {layer}, first decode step)")
+    plt.tight_layout()
+    out = traj_path / "figures" / f"pca_mutation_type_L{layer}.png"
+    out.parent.mkdir(exist_ok=True)
+    plt.savefig(out, dpi=dpi)
+    plt.close()
+    logger.info(f"Saved mutation_type PCA plot to {out}")
+
+
 def plot_ccs_separation(traj_path: Path, dpi: int) -> None:
     plt = _get_matplotlib()
     if plt is None:
@@ -283,8 +390,10 @@ def run_visualize(args: VisualizeArgs) -> None:
 
     plot_probe_heatmap(traj_path, "is_buggy", args.layers, args.dpi)
     plot_probe_heatmap(traj_path, "will_be_correct", args.layers, args.dpi)
+    plot_probe_content_heatmap(traj_path, args.layers, args.dpi)
     for layer in args.layers:
         plot_pca_trajectories(traj_path, layer, args.n_traj_examples, args.dpi)
+        plot_pca_mutation_type(traj_path, layer, args.n_traj_examples, args.dpi)
     plot_change_point_hist(traj_path, args.layers, "cosine", args.dpi)
     plot_change_point_hist(traj_path, args.layers, "l2", args.dpi)
     plot_ccs_separation(traj_path, args.dpi)

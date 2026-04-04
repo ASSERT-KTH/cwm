@@ -61,11 +61,9 @@ def _exact_dmd(
     X = torch.cat(X_list, dim=0)   # [N_pairs, dim]
     Xp = torch.cat(Xp_list, dim=0)
 
-    # Truncated SVD of X
-    U, S, Vh = torch.linalg.svd(X, full_matrices=False)
-    U = U[:, :r]
-    S = S[:r]
-    Vh = Vh[:r, :]
+    # Randomised truncated SVD — only computes top-r modes (much faster than full SVD)
+    U, S, V = torch.svd_lowrank(X, q=r, niter=4)
+    Vh = V.T  # [r, dim]
 
     # Reduced DMD operator: A_tilde = U^T X' V S^{-1}
     S_inv = 1.0 / S.clamp(min=1e-8)
@@ -115,36 +113,31 @@ def run_dmd(args: DMDArgs) -> None:
 
     all_results: dict = {}
 
-    # Single pass over files: collect trajectories for all layers
-    trajs_by_layer_orig: dict[int, list] = {L: [] for L in args.layers}
-    trajs_by_layer_buggy: dict[int, list] = {L: [] for L in args.layers}
+    # Process one layer at a time to avoid OOM (loading all layers simultaneously
+    # at float32 with 1280 samples × ~256 steps × 6144 dims × 4 layers ≈ 7.5 GB).
+    for layer in args.layers:
+        trajs_orig: list[torch.Tensor] = []
+        trajs_buggy: list[torch.Tensor] = []
 
-    for meta in index:
-        sid = meta["sample_id"]
-        pt = traj_subdir / f"{sid}.pt"
-        if not pt.exists():
-            continue
-        sample = torch.load(pt, map_location="cpu", weights_only=False)
-        traj = sample.get("trajectory", {})
-        is_buggy = meta.get("is_buggy", False)
-
-        for layer in args.layers:
+        for meta in index:
+            sid = meta["sample_id"]
+            pt = traj_subdir / f"{sid}.pt"
+            if not pt.exists():
+                continue
+            sample = torch.load(pt, map_location="cpu", weights_only=False)
+            traj = sample.get("trajectory", {})
             h = traj.get(layer)
             if h is None:
                 h = traj.get(str(layer))
             if h is None or h.shape[0] < args.min_traj_len:
                 continue
-            if is_buggy:
-                trajs_by_layer_buggy[layer].append(h.float())
+            if meta.get("is_buggy", False):
+                trajs_buggy.append(h.float())
             else:
-                trajs_by_layer_orig[layer].append(h.float())
-
-    for layer in args.layers:
-        trajs_orig = trajs_by_layer_orig[layer]
-        trajs_buggy = trajs_by_layer_buggy[layer]
+                trajs_orig.append(h.float())
 
         # Subsample to keep SVD tractable on CPU
-        rng = torch.Generator().manual_seed(args.seed)
+        rng = torch.Generator().manual_seed(args.seed + layer)
         if len(trajs_orig) > args.max_trajs_per_condition:
             idx = torch.randperm(len(trajs_orig), generator=rng)[:args.max_trajs_per_condition]
             trajs_orig = [trajs_orig[i] for i in idx.tolist()]
@@ -175,11 +168,13 @@ def run_dmd(args: DMDArgs) -> None:
             print(f"  {n_persistent}/{r} modes with |λ| > 0.95 (persistent state)")
 
         if dmd_orig.get("magnitudes") is not None and dmd_buggy.get("magnitudes") is not None:
-            # Compare dominant modes between original and buggy
             mags_orig = dmd_orig["magnitudes"][:5].tolist()
             mags_buggy = dmd_buggy["magnitudes"][:5].tolist()
             print(f"  Original top-5 mag: {[f'{m:.3f}' for m in mags_orig]}")
             print(f"  Buggy    top-5 mag: {[f'{m:.3f}' for m in mags_buggy]}")
+
+        # Explicitly free trajectory tensors before next layer pass
+        del trajs_orig, trajs_buggy
 
     out = traj_path / "dmd.pt"
     torch.save({"results": all_results, "args": vars(args)}, out)

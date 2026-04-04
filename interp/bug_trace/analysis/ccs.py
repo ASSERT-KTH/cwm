@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import json
 import logging
+import random
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -42,6 +43,7 @@ class CCSArgs:
     lr: float = 1e-3
     seed: int = 42
     n_directions: int = 3      # find top N CCS directions (random restarts)
+    test_fraction: float = 0.3  # fraction of original_ids held out for evaluation
 
 
 def _get_bin_repr(h_traj: torch.Tensor, time_bin: str) -> torch.Tensor:
@@ -116,7 +118,6 @@ def run_ccs(args: CCSArgs) -> None:
     traj_subdir = traj_path / "trajectories"
 
     # Build paired (original, buggy) matrices per layer
-    # Index by original_id to match pairs
     orig_by_id: dict[str, dict] = {}
     buggy_by_id: dict[str, list[dict]] = {}
 
@@ -127,52 +128,91 @@ def run_ccs(args: CCSArgs) -> None:
         else:
             buggy_by_id.setdefault(oid, []).append(meta)
 
+    # Train/test split by original_id so no program appears in both splits.
+    # This ensures the CCS direction is never fitted on test-set samples,
+    # making the causal steering evaluation (activation_patch.py) a clean
+    # generalization test.
+    all_oids = sorted(orig_by_id.keys())
+    rng = random.Random(args.seed)
+    rng.shuffle(all_oids)
+    n_test = max(1, int(len(all_oids) * args.test_fraction))
+    test_oids = set(all_oids[:n_test])
+    train_oids = set(all_oids[n_test:])
+
+    logger.info(
+        f"CCS split: {len(train_oids)} train originals / {len(test_oids)} test originals "
+        f"(test_fraction={args.test_fraction})"
+    )
+
+    # Count train/test pairs
+    n_train_pairs = sum(len(buggy_by_id.get(oid, [])) for oid in train_oids)
+    n_test_pairs = sum(len(buggy_by_id.get(oid, [])) for oid in test_oids)
+    print(f"  Train pairs: {n_train_pairs}, Test pairs: {n_test_pairs}")
+
+    # Save split for use by activation_patch.py
+    split_info = {
+        "train_original_ids": sorted(train_oids),
+        "test_original_ids": sorted(test_oids),
+        "test_fraction": args.test_fraction,
+        "seed": args.seed,
+        "n_train_originals": len(train_oids),
+        "n_test_originals": len(test_oids),
+        "n_train_pairs": n_train_pairs,
+        "n_test_pairs": n_test_pairs,
+    }
+    split_path = traj_path / "ccs_split.json"
+    with split_path.open("w") as f:
+        json.dump(split_info, f, indent=2)
+    logger.info(f"Saved CCS split to {split_path}")
+
     results: dict = {}
 
-    for layer in args.layers:
-        h_pos_list, h_neg_list = [], []
-
-        for oid, orig_meta in orig_by_id.items():
+    def _load_pairs_for_oids(oid_set, layer):
+        """Load (h_pos, h_neg) pairs for a given set of original_ids."""
+        pos_list, neg_list = [], []
+        for oid in oid_set:
+            orig_meta = orig_by_id.get(oid)
+            if orig_meta is None:
+                continue
             buggy_metas = buggy_by_id.get(oid, [])
             if not buggy_metas:
                 continue
-
-            # Load original trajectory
             orig_pt = traj_subdir / f"{orig_meta['sample_id']}.pt"
             if not orig_pt.exists():
                 continue
             orig_sample = torch.load(orig_pt, map_location="cpu", weights_only=False)
-            orig_traj = orig_sample.get("trajectory", {})
-            h_orig = orig_traj.get(layer)
+            h_orig = orig_sample.get("trajectory", {}).get(layer)
             if h_orig is None:
-                h_orig = orig_traj.get(str(layer))
+                h_orig = orig_sample.get("trajectory", {}).get(str(layer))
             if h_orig is None:
                 continue
             repr_orig = _get_bin_repr(h_orig, args.time_bin)
-
             for buggy_meta in buggy_metas:
                 buggy_pt = traj_subdir / f"{buggy_meta['sample_id']}.pt"
                 if not buggy_pt.exists():
                     continue
                 buggy_sample = torch.load(buggy_pt, map_location="cpu", weights_only=False)
-                buggy_traj = buggy_sample.get("trajectory", {})
-                h_buggy = buggy_traj.get(layer)
+                h_buggy = buggy_sample.get("trajectory", {}).get(layer)
                 if h_buggy is None:
-                    h_buggy = buggy_traj.get(str(layer))
+                    h_buggy = buggy_sample.get("trajectory", {}).get(str(layer))
                 if h_buggy is None:
                     continue
-                repr_buggy = _get_bin_repr(h_buggy, args.time_bin)
-                h_pos_list.append(repr_orig)
-                h_neg_list.append(repr_buggy)
+                pos_list.append(repr_orig)
+                neg_list.append(_get_bin_repr(h_buggy, args.time_bin))
+        return pos_list, neg_list
+
+    for layer in args.layers:
+        # Load train pairs (used to fit the CCS direction)
+        h_pos_list, h_neg_list = _load_pairs_for_oids(train_oids, layer)
 
         if len(h_pos_list) < 5:
-            logger.warning(f"Layer {layer}: only {len(h_pos_list)} pairs, skipping CCS")
+            logger.warning(f"Layer {layer}: only {len(h_pos_list)} train pairs, skipping CCS")
             continue
 
         h_pos = torch.stack(h_pos_list)
         h_neg = torch.stack(h_neg_list)
 
-        # Normalise
+        # Normalise using train-set statistics only
         mu = (h_pos.mean(0) + h_neg.mean(0)) / 2
         std = torch.cat([h_pos, h_neg]).std(0).clamp(min=1e-8)
         h_pos_n = (h_pos - mu) / std
@@ -182,7 +222,7 @@ def run_ccs(args: CCSArgs) -> None:
         h_pos_n = h_pos_n.to(device)
         h_neg_n = h_neg_n.to(device)
 
-        # Multiple random restarts
+        # Multiple random restarts, select best direction on TRAIN set
         best_dir, best_loss = None, float("inf")
         all_dirs = []
         for k in range(args.n_directions):
@@ -192,29 +232,51 @@ def run_ccs(args: CCSArgs) -> None:
                 best_loss = loss
                 best_dir = d.cpu()
 
-        # Evaluate: how well does the best direction separate?
+        # Train-set separation accuracy
         with torch.no_grad():
             d_gpu = best_dir.to(device)
-            p_scores = (h_pos_n @ d_gpu).cpu()
-            n_scores = (h_neg_n @ d_gpu).cpu()
-            # Accuracy: do we correctly predict original > buggy?
-            acc = float((p_scores > n_scores).float().mean().item())
+            train_acc = float(
+                ((h_pos_n @ d_gpu) > (h_neg_n @ d_gpu)).float().mean().item()
+            )
+
+        # Test-set evaluation (held-out pairs — never seen during fitting)
+        test_pos_list, test_neg_list = _load_pairs_for_oids(test_oids, layer)
+        test_acc = float("nan")
+        n_test = 0
+        if test_pos_list:
+            tp = torch.stack(test_pos_list)
+            tn = torch.stack(test_neg_list)
+            tp_n = ((tp - mu) / std).to(device)
+            tn_n = ((tn - mu) / std).to(device)
+            with torch.no_grad():
+                test_acc = float(
+                    ((tp_n @ d_gpu) > (tn_n @ d_gpu)).float().mean().item()
+                )
+            n_test = tp.shape[0]
 
         logger.info(
             f"Layer {layer}: CCS loss={best_loss:.4f}, "
-            f"separation acc={acc:.3f} (n={h_pos.shape[0]} pairs)"
+            f"train_acc={train_acc:.3f} (n={h_pos.shape[0]}), "
+            f"test_acc={test_acc:.3f} (n={n_test})"
         )
 
         results[layer] = {
             "direction": best_dir,
             "loss": best_loss,
-            "separation_acc": acc,
+            "separation_acc": train_acc,       # backward-compat key
+            "train_separation_acc": train_acc,
+            "test_separation_acc": test_acc,
             "n_pairs": h_pos.shape[0],
+            "n_test_pairs": n_test,
             "feature_mean": mu.cpu(),
             "feature_std": std.cpu(),
             "all_directions": [(d, l) for d, l in all_dirs],
         }
-        print(f"  Layer {layer:2d}: CCS acc={acc:.3f}, loss={best_loss:.4f} (n={h_pos.shape[0]})")
+        print(
+            f"  Layer {layer:2d}: train_acc={train_acc:.3f}  "
+            f"test_acc={test_acc:.3f}  loss={best_loss:.4f}  "
+            f"(n_train={h_pos.shape[0]}, n_test={n_test})"
+        )
 
     out = traj_path / f"ccs_{args.time_bin}.pt"
     torch.save({"results": results, "args": vars(args)}, out)

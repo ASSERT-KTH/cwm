@@ -71,7 +71,9 @@ class PatchArgs:
     layers_to_patch: list[int] = field(default_factory=lambda: [16, 32, 48, 63])
     # Patch at specific relative time positions (e.g., 0.25 = first quarter)
     time_positions: list[float] = field(default_factory=lambda: [0.1, 0.25, 0.5, 0.75, 1.0])
-    n_pairs: int = 50     # number of (original, buggy) pairs to patch
+    n_pairs: int = 50     # number of (original, buggy) pairs to patch; 0 = all
+    # Path to ccs_split.json; if set, restrict to test-split original_ids only
+    ccs_split_path: str = ""
     seed: int = 42
     gen_args: FastGenArgs = field(
         default_factory=lambda: FastGenArgs(
@@ -245,6 +247,22 @@ def main(args: PatchArgs) -> None:
         pairs = load_pairs(args.pairs_path)
         all_samples = pairs_to_samples(pairs, include_originals=False)  # buggy only
         buggy_samples = [s for s in all_samples if s.is_buggy]
+
+        # Restrict to CCS test-split if requested (avoids direction-leakage)
+        if args.ccs_split_path:
+            split_file = Path(args.ccs_split_path)
+            if split_file.exists():
+                with split_file.open() as f:
+                    split_info = json.load(f)
+                test_oids = set(split_info.get("test_original_ids", []))
+                buggy_samples = [s for s in buggy_samples if s.original_id in test_oids]
+                logger.info(
+                    f"CCS split loaded: restricting to {len(buggy_samples)} test-split "
+                    f"buggy samples ({len(test_oids)} test original_ids)"
+                )
+            else:
+                logger.warning(f"ccs_split_path={args.ccs_split_path} not found; using all samples")
+
         if args.n_pairs > 0:
             buggy_samples = buggy_samples[: args.n_pairs]
 
