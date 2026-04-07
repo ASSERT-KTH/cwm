@@ -1,0 +1,182 @@
+[
+  {
+    "pair_id": "sample_735__swapped_arguments",
+    "original_id": "sample_735",
+    "original_code": "def f(sentence):\n    if sentence == '':\n        return ''\n    sentence = sentence.replace('(', '')\n    sentence = sentence.replace(')', '')\n    return sentence.capitalize().replace(' ', '')",
+    "input_str": "'(A (b B))'",
+    "correct_output": "'Abb'",
+    "buggy_code": "def f(sentence):\n    if sentence == '':\n        return ''\n    sentence = sentence.replace('', '(')\n    sentence = sentence.replace(')', '')\n    return sentence.capitalize().replace(' ', '')",
+    "wrong_output": "'(((a((((b((b((('",
+    "mutation_type": "swapped_arguments"
+  },
+  {
+    "pair_id": "sample_737__wrong_variable",
+    "original_id": "sample_737",
+    "original_code": "def f(nums):\n    counts = 0\n    for i in nums:\n        if str(i).isdecimal():\n            if counts == 0:\n                counts += 1\n    return counts",
+    "input_str": "[0, 6, 2, -1, -2]",
+    "correct_output": "1",
+    "buggy_code": "def f(nums):\n    counts = 0\n    for i in nums:\n        if str(i).isdecimal():\n            if counts == 0:\n                counts += 1\n    return i",
+    "wrong_output": "-2",
+    "mutation_type": "wrong_variable"
+  },
+  {
+    "pair_id": "sample_742__wrong_variable",
+    "original_id": "sample_742",
+    "original_code": "def f(text):\n    b = True\n    for x in text:\n        if x.isdigit():\n            b = True\n        else:\n            b = False\n            break\n    return b",
+    "input_str": "\"-1-3\"",
+    "correct_output": "False",
+    "buggy_code": "def f(text):\n    b = True\n    for x in text:\n        if x.isdigit():\n            b = True\n        else:\n            b = False\n            break\n    return x",
+    "wrong_output": "'-'",
+    "mutation_type": "wrong_variable"
+  },
+  {
+    "pair_id": "sample_746__wrong_variable",
+    "original_id": "sample_746",
+    "original_code": "def f(dct):\n    values = dct.values()\n    result = {}\n    for value in values:\n        item = value.split('.')[0]+'@pinc.uk'\n        result[value] = item\n    return result",
+    "input_str": "{}",
+    "correct_output": "{}",
+    "buggy_code": "def f(dct):\n    values = dct.values()\n    result = {}\n    for value in values:\n        item = value.split('.')[0] + '@pinc.uk'\n        result[value] = item\n    return values",
+    "wrong_output": "dict_values([])",
+    "mutation_type": "wrong_variable"
+  },
+  {
+    "pair_id": "sample_749__deleted_accumulator",
+    "original_id": "sample_749",
+    "original_code": "def f(text, width):\n    result = \"\"\n    lines = text.split('\\n')\n    for l in lines:\n        result += l.center(width)\n        result += '\\n'\n\n    # Remove the very last empty line\n    result = result[:-1]\n    return result",
+    "input_str": "'l\\nl', 2",
+    "correct_output": "'l \\nl '",
+    "buggy_code": "def f(text, width):\n    result = ''\n    lines = text.split('\\n')\n    for l in lines:\n        result += '\\n'\n    result = result[:-1]\n    return result",
+    "wrong_output": "'\\n'",
+    "mutation_type": "deleted_accumulator"
+  },
+  {
+    "pair_id": "sample_751__wrong_variable",
+    "original_id": "sample_751",
+    "original_code": "def f(text, char, min_count):\n    count = text.count(char)\n    if count < min_count:\n        return text.swapcase()\n    return text",
+    "input_str": "\"wwwwhhhtttpp\", 'w', 3",
+    "correct_output": "'wwwwhhhtttpp'",
+    "buggy_code": "def f(text, char, min_count):\n    count = text.count(char)\n    if count < min_count:\n        return text.swapcase()\n    return count",
+    "wrong_output": "4",
+    "mutation_type": "wrong_variable"
+  },
+  {
+    "pair_id": "sample_755__wrong_variable",
+    "original_id": "sample_755",
+    "original_code": "def f(replace, text, hide):\n    while hide in text:\n        replace += 'ax'\n        text = text.replace(hide, replace, 1)\n    return text",
+    "input_str": "'###', \"ph>t#A#BiEcDefW#ON#iiNCU\", '.'",
+    "correct_output": "'ph>t#A#BiEcDefW#ON#iiNCU'",
+    "buggy_code": "def f(replace, text, hide):\n    while hide in text:\n        replace += 'ax'\n        text = text.replace(hide, replace, 1)\n    return replace",
+    "wrong_output": "'###'",
+    "mutation_type": "wrong_variable"
+  },
+  {
+    "pair_id": "sample_759__wrong_variable",
+    "original_id": "sample_759",
+    "original_code": "def f(text, sub):\n    index = []\n    starting = 0\n    while starting != -1:\n        starting = text.find(sub, starting)\n        if starting != -1:\n            index.append(starting)\n            starting += len(sub)\n    return index",
+    "input_str": "'egmdartoa', 'good'",
+    "correct_output": "[]",
+    "buggy_code": "def f(text, sub):\n    index = []\n    starting = 0\n    while starting != -1:\n        starting = text.find(sub, starting)\n        if starting != -1:\n            index.append(starting)\n            starting += len(sub)\n    return starting",
+    "wrong_output": "-1",
+    "mutation_type": "wrong_variable"
+  },
+  {
+    "pair_id": "sample_764__wrong_variable",
+    "original_id": "sample_764",
+    "original_code": "def f(text, old, new):\n    text2 = text.replace(old, new)\n    old2 = old[::-1]\n    while old2 in text2:\n        text2 = text2.replace(old2, new)\n    return text2",
+    "input_str": "\"some test string\", \"some\", \"any\"",
+    "correct_output": "'any test string'",
+    "buggy_code": "def f(text, old, new):\n    text2 = text.replace(old, new)\n    old2 = old[::-1]\n    while old2 in text2:\n        text2 = text2.replace(old2, new)\n    return old2",
+    "wrong_output": "'emos'",
+    "mutation_type": "wrong_variable"
+  },
+  {
+    "pair_id": "sample_766__wrong_variable",
+    "original_id": "sample_766",
+    "original_code": "def f(values, value):\n    length = len(values)\n    new_dict = dict.fromkeys(values, value)\n    new_dict[''.join(sorted(values))] = value * 3\n    return new_dict",
+    "input_str": "['0','3'], 117",
+    "correct_output": "{'0': 117, '3': 117, '03': 351}",
+    "buggy_code": "def f(values, value):\n    length = len(values)\n    new_dict = dict.fromkeys(values, value)\n    new_dict[''.join(sorted(values))] = value * 3\n    return length",
+    "wrong_output": "2",
+    "mutation_type": "wrong_variable"
+  },
+  {
+    "pair_id": "sample_770__wrong_variable",
+    "original_id": "sample_770",
+    "original_code": "def f(line, char):\n    count = line.count(char)\n    for i in range(count+1, 0, -1):\n        line = line.center(len(line)+i // len(char), char)\n    return line",
+    "input_str": "'$78'.upper(), '$'",
+    "correct_output": "'$$78$$'",
+    "buggy_code": "def f(line, char):\n    count = line.count(char)\n    for i in range(count + 1, 0, -1):\n        line = line.center(len(line) + i // len(char), char)\n    return count",
+    "wrong_output": "1",
+    "mutation_type": "wrong_variable"
+  },
+  {
+    "pair_id": "sample_771__wrong_variable",
+    "original_id": "sample_771",
+    "original_code": "def f(items):\n    items = list(items)\n    odd_positioned = []\n    while len(items) > 0:\n        position = items.index(min(items))\n        items.pop(position)\n        item = items.pop(position)\n        odd_positioned.append(item)\n    return odd_positioned",
+    "input_str": "(1, 2, 3, 4, 5, 6, 7, 8)",
+    "correct_output": "[2, 4, 6, 8]",
+    "buggy_code": "def f(items):\n    items = list(items)\n    odd_positioned = []\n    while len(items) > 0:\n        position = items.index(min(items))\n        items.pop(position)\n        item = items.pop(position)\n        odd_positioned.append(item)\n    return items",
+    "wrong_output": "[]",
+    "mutation_type": "wrong_variable"
+  },
+  {
+    "pair_id": "sample_774__swapped_arguments",
+    "original_id": "sample_774",
+    "original_code": "def f(num, name):\n    f_str = 'quiz leader = {}, count = {}'\n    return f_str.format(name, num)",
+    "input_str": "23, 'Cornareti'",
+    "correct_output": "'quiz leader = Cornareti, count = 23'",
+    "buggy_code": "def f(num, name):\n    f_str = 'quiz leader = {}, count = {}'\n    return f_str.format(num, name)",
+    "wrong_output": "'quiz leader = 23, count = Cornareti'",
+    "mutation_type": "swapped_arguments"
+  },
+  {
+    "pair_id": "sample_775__wrong_variable",
+    "original_id": "sample_775",
+    "original_code": "def f(nums):\n    count = len(nums)\n    for i in range(0, count // 2):\n        nums[i], nums[count-i-1] = nums[count-i-1], nums[i]\n    return nums",
+    "input_str": "[2, 6, 1, 3, 1]",
+    "correct_output": "[1, 3, 1, 6, 2]",
+    "buggy_code": "def f(nums):\n    count = len(nums)\n    for i in range(0, count // 2):\n        nums[i], nums[count - i - 1] = (nums[count - i - 1], nums[i])\n    return count",
+    "wrong_output": "5",
+    "mutation_type": "wrong_variable"
+  },
+  {
+    "pair_id": "sample_780__deleted_accumulator",
+    "original_id": "sample_780",
+    "original_code": "def f(ints):\n    counts = [0] * 301\n\n    for i in ints:\n        counts[i] += 1\n\n    r = []\n    for i in range(len(counts)):\n        if counts[i] >= 3:\n            r.append(str(i))\n    counts.clear()\n    return ' '.join(r)",
+    "input_str": "[2, 3, 5, 2, 4, 5, 2, 89]",
+    "correct_output": "'2'",
+    "buggy_code": "def f(ints):\n    counts = [0] * 301\n    for i in ints:\n        pass\n    r = []\n    for i in range(len(counts)):\n        if counts[i] >= 3:\n            r.append(str(i))\n    counts.clear()\n    return ' '.join(r)",
+    "wrong_output": "''",
+    "mutation_type": "deleted_accumulator"
+  },
+  {
+    "pair_id": "sample_785__wrong_variable",
+    "original_id": "sample_785",
+    "original_code": "def f(n):\n    streak = ''\n    for c in str(n):\n        streak += c.ljust(int(c) * 2)\n    return streak",
+    "input_str": "1",
+    "correct_output": "'1 '",
+    "buggy_code": "def f(n):\n    streak = ''\n    for c in str(n):\n        streak += c.ljust(int(c) * 2)\n    return c",
+    "wrong_output": "'1'",
+    "mutation_type": "wrong_variable"
+  },
+  {
+    "pair_id": "sample_793__swapped_arguments",
+    "original_id": "sample_793",
+    "original_code": "def f(list, start, end):\n    count = 0\n    for i in range(start, end):\n        for j in range(i, end):\n            if list[i] != list[j]:\n                count += 1\n    return count",
+    "input_str": "[1, 2, 4, 3, 2, 1], 0, 3",
+    "correct_output": "3",
+    "buggy_code": "def f(list, start, end):\n    count = 0\n    for i in range(end, start):\n        for j in range(i, end):\n            if list[i] != list[j]:\n                count += 1\n    return count",
+    "wrong_output": "0",
+    "mutation_type": "swapped_arguments"
+  },
+  {
+    "pair_id": "sample_797__wrong_variable",
+    "original_id": "sample_797",
+    "original_code": "def f(dct):\n    lst = []\n    for key in sorted(dct):\n        lst.append((key, dct[key]))\n    return lst",
+    "input_str": "{'a': 1, 'b': 2, 'c': 3}",
+    "correct_output": "[('a', 1), ('b', 2), ('c', 3)]",
+    "buggy_code": "def f(dct):\n    lst = []\n    for key in sorted(dct):\n        lst.append((key, dct[key]))\n    return key",
+    "wrong_output": "'c'",
+    "mutation_type": "wrong_variable"
+  }
+]
