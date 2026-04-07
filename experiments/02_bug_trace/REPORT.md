@@ -828,6 +828,43 @@ Most frequent tokens at T* (layer 32 / layer 16): function words and punctuation
 concentration on specific semantic tokens, consistent with the diffuse change-point
 finding for easy mutations.
 
+#### 3.10.4 Fine-grained temporal probe: 50 bins
+
+**Motivation**: The 10-bin probe (Section 3.10.1) has ~30,000 vectors per bin and
+covers ~10% of the generation per bin. A concern was that a sharp transition (e.g.
+at the moment the model identifies the bug type) could be averaged out at this
+resolution. Re-ran with 50 bins (~6,000 vectors/bin, each bin ~2% of generation).
+
+**Context window caveat**: 48% of samples (268/559) hit the `max_gen=4096` token
+limit and are truncated at exactly 820 captured steps (stride=5). Their reasoning
+chains are incomplete. This affects all bins but particularly late bins, where
+truncated samples are overrepresented. A re-extraction at 16k context is underway
+(Experiment 05, jobs 16124660/16124661).
+
+**Results** (val_acc, 50 bins, layer 32 — selected bins shown):
+
+| Layer | bin0  | bin5  | bin10 | bin15 | bin20 | bin25 | bin30 | bin35 | bin40 | bin45 | bin49 | perm_bl |
+|-------|-------|-------|-------|-------|-------|-------|-------|-------|-------|-------|-------|---------|
+| 16    | 0.523 | 0.653 | 0.636 | 0.652 | 0.593 | 0.627 | 0.764 | 0.622 | 0.618 | 0.665 | 0.602 | 0.421   |
+| 32    | 0.671 | 0.755 | 0.754 | 0.771 | 0.738 | 0.746 | 0.769 | 0.770 | 0.736 | 0.768 | 0.768 | 0.410   |
+| 48    | 0.654 | 0.726 | 0.713 | 0.706 | 0.694 | 0.718 | 0.684 | 0.761 | 0.683 | 0.697 | 0.692 | 0.399   |
+| 63    | 0.586 | 0.613 | 0.610 | 0.607 | 0.547 | 0.604 | 0.561 | 0.590 | 0.581 | 0.581 | 0.635 | 0.389   |
+
+**Interpretation**: The 50-bin profile is **flat and noisy** across all layers — no
+sharp transition, no step function, no identifiable "aha moment." The variance across
+bins (~±0.05) is consistent with sampling noise from ~6,000 vectors/bin rather than
+any real temporal structure. This confirms the 10-bin result is not hiding a sharp
+jump at finer resolution.
+
+The flat profile on the existing 4k-context data has two possible interpretations:
+1. The mutation type representation is genuinely static (read from prompt at the
+   start, maintained without change throughout generation)
+2. The 48% truncation rate at 4096 tokens distorts late-bin statistics — truncated
+   samples may show different representational dynamics than samples that complete
+
+Experiment 05 (16k context re-extraction) will disambiguate these: if the flat profile
+persists on untruncated 16k generations, interpretation (1) is correct.
+
 ---
 
 ### 3.11 Experiment 04: Bug-Only Trajectories (Methodological Fix)

@@ -83,6 +83,7 @@ class BugExtractArgs:
     stride: int = _STRIDE         # capture every N-th decode step
     n_samples: int = 0            # 0 = all pairs
     include_originals: bool = True  # if False, only extract buggy samples (avoids contradictory prompts)
+    max_gen: int = 0              # 0 = use track default (_MAX_GEN); set explicitly to override
     seed: int = 42
     wandb_project: str = "cwm-interp"
     wandb_run_name: str = ""
@@ -376,7 +377,7 @@ def main(args: BugExtractArgs) -> None:
         results: list[dict] = []
         exc_queue: queue.Queue = queue.Queue()
         done_event = threading.Event()
-        max_gen = _MAX_GEN.get(args.track, 4096)
+        max_gen = args.max_gen if args.max_gen > 0 else _MAX_GEN.get(args.track, 4096)
 
         if is_tp_rank_zero:
             pbar = tqdm(
