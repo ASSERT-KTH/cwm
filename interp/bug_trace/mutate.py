@@ -118,13 +118,140 @@ class WrongComparatorMutator(_FirstMutationTransformer):
         return self.generic_visit(node)
 
 
+class WrongVariableMutator(ast.NodeTransformer):
+    """Swap the returned local variable for a different local variable in the same function.
+
+    Requires execution reasoning: to know which variable is the intended result, the
+    reader must mentally trace the computation — surface-level syntactic reading is not
+    enough to distinguish e.g. ``return result`` vs ``return total``.
+    """
+
+    def __init__(self) -> None:
+        self.mutated = False
+
+    def visit_FunctionDef(self, node: ast.FunctionDef) -> ast.AST:
+        return self._visit_func(node)
+
+    def visit_AsyncFunctionDef(self, node: ast.AsyncFunctionDef) -> ast.AST:
+        return self._visit_func(node)
+
+    def _visit_func(self, node: ast.AST) -> ast.AST:
+        if self.mutated:
+            return node
+
+        # Collect all local variable names assigned anywhere in this function
+        assigned: list[str] = []
+        seen: set[str] = set()
+        for n in ast.walk(node):
+            targets: list[ast.expr] = []
+            if isinstance(n, ast.Assign):
+                targets = list(n.targets)
+            elif isinstance(n, (ast.AugAssign, ast.AnnAssign)):
+                targets = [n.target]
+            elif isinstance(n, ast.For):
+                targets = [n.target]
+            for t in targets:
+                if isinstance(t, ast.Name) and t.id not in seen:
+                    seen.add(t.id)
+                    assigned.append(t.id)
+
+        # Find the first return statement that returns a bare Name
+        for n in ast.walk(node):
+            if isinstance(n, ast.Return) and isinstance(n.value, ast.Name):
+                ret_name = n.value.id
+                candidates = [v for v in assigned if v != ret_name]
+                if candidates:
+                    self.mutated = True
+                    # Modify in-place (safe: we stop after this)
+                    n.value = ast.Name(id=candidates[0], ctx=ast.Load())
+                    break
+
+        return node
+
+
+class DeletedAccumulatorMutator(_FirstMutationTransformer):
+    """Remove the first augmented-assignment accumulation step inside a for/while loop.
+
+    Example: removes ``result += x`` from a loop body, leaving the initialiser
+    (``result = 0``) intact.  The model must simulate the loop to detect that the
+    accumulation is missing — a pure read of variable names does not reveal the bug.
+    """
+
+    _AUG_OPS = (ast.Add, ast.Sub, ast.Mult, ast.BitOr, ast.BitAnd)
+
+    def _remove_first_augassign(self, body: list[ast.stmt]) -> list[ast.stmt] | None:
+        """Return new body with first matching AugAssign removed, or None."""
+        new_body: list[ast.stmt] = []
+        removed = False
+        for stmt in body:
+            if (
+                not removed
+                and isinstance(stmt, ast.AugAssign)
+                and isinstance(stmt.op, self._AUG_OPS)
+            ):
+                removed = True
+                continue
+            new_body.append(stmt)
+        if removed:
+            return new_body or [ast.Pass()]
+        return None
+
+    def visit_For(self, node: ast.For) -> ast.AST:
+        if self.mutated:
+            return self.generic_visit(node)
+        new_body = self._remove_first_augassign(node.body)
+        if new_body is not None:
+            self.mutated = True
+            new_node = copy.copy(node)
+            new_node.body = new_body
+            return new_node
+        return self.generic_visit(node)
+
+    def visit_While(self, node: ast.While) -> ast.AST:
+        if self.mutated:
+            return self.generic_visit(node)
+        new_body = self._remove_first_augassign(node.body)
+        if new_body is not None:
+            self.mutated = True
+            new_node = copy.copy(node)
+            new_node.body = new_body
+            return new_node
+        return self.generic_visit(node)
+
+
+class SwappedArgumentsMutator(_FirstMutationTransformer):
+    """Swap the first two positional arguments in the first eligible function call.
+
+    Targets calls with ≥2 positional args that are not in the function signature
+    (i.e. internal calls), e.g. ``sorted(lst, key=fn)`` → the two positional args
+    swap.  Detecting this requires knowing what the callee expects — execution
+    knowledge, not just token matching.
+    """
+
+    def visit_Call(self, node: ast.Call) -> ast.AST:
+        if not self.mutated and len(node.args) >= 2:
+            self.mutated = True
+            new_node = copy.copy(node)
+            new_args = list(node.args)
+            new_args[0], new_args[1] = new_args[1], new_args[0]
+            new_node.args = new_args
+            return new_node
+        return self.generic_visit(node)
+
+
 _MUTATOR_CLASSES: dict[str, list] = {
     "off_by_one_plus": [lambda: OffByOneMutator(delta=1)],
     "off_by_one_minus": [lambda: OffByOneMutator(delta=-1)],
     "wrong_operator": [WrongOperatorMutator],
     "condition_flip": [ConditionFlipMutator],
     "wrong_comparator": [WrongComparatorMutator],
+    # Hard mutations (require execution reasoning)
+    "wrong_variable": [WrongVariableMutator],
+    "deleted_accumulator": [DeletedAccumulatorMutator],
+    "swapped_arguments": [SwappedArgumentsMutator],
 }
+
+HARD_MUTATION_TYPES = ["wrong_variable", "deleted_accumulator", "swapped_arguments"]
 
 
 # ---------------------------------------------------------------------------
@@ -284,9 +411,25 @@ def main() -> None:
     parser.add_argument("--max_mutations_per_sample", type=int, default=3)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--dry_run", type=int, default=0, help="Print N pairs and exit")
+    parser.add_argument(
+        "--hard", action="store_true",
+        help="Use hard mutation types only (wrong_variable, deleted_accumulator, swapped_arguments)"
+    )
+    parser.add_argument(
+        "--mutation_types", type=str, default="",
+        help="Comma-separated list of mutation types to use (overrides --hard)"
+    )
     args = parser.parse_args()
 
     logging.basicConfig(level=logging.INFO)
+
+    # Determine which mutation types to use
+    if args.mutation_types:
+        mutation_types = [m.strip() for m in args.mutation_types.split(",") if m.strip()]
+    elif args.hard:
+        mutation_types = HARD_MUTATION_TYPES
+    else:
+        mutation_types = None  # use all
 
     from datasets import load_dataset
 
@@ -295,7 +438,11 @@ def main() -> None:
         dataset = dataset[: args.n_samples]
 
     rng = random.Random(args.seed)
-    pairs = list(generate_pairs(dataset, rng, max_mutations_per_sample=args.max_mutations_per_sample))
+    pairs = list(generate_pairs(
+        dataset, rng,
+        mutation_types=mutation_types,
+        max_mutations_per_sample=args.max_mutations_per_sample,
+    ))
 
     # Statistics
     from collections import Counter

@@ -81,7 +81,8 @@ class BugExtractArgs:
     track: str = "track_a"        # track_a | track_b
     layers: list[int] = field(default_factory=lambda: list(_DEFAULT_LAYERS))
     stride: int = _STRIDE         # capture every N-th decode step
-    n_samples: int = 0            # 0 = all pairs (both original and buggy)
+    n_samples: int = 0            # 0 = all pairs
+    include_originals: bool = True  # if False, only extract buggy samples (avoids contradictory prompts)
     seed: int = 42
     wandb_project: str = "cwm-interp"
     wandb_run_name: str = ""
@@ -355,7 +356,7 @@ def main(args: BugExtractArgs) -> None:
 
         # Load dataset
         pairs = load_pairs(args.pairs_path)
-        all_samples = pairs_to_samples(pairs, include_originals=True)
+        all_samples = pairs_to_samples(pairs, include_originals=args.include_originals)
         if args.n_samples > 0:
             all_samples = all_samples[: args.n_samples]
 

@@ -36,6 +36,27 @@ a linearly decodable, causally relevant "program fate" representation in its lay
 stream, which evolves during chain-of-thought reasoning. The causal effect size is modest
 (~+2 pp) but dose-responsive and consistent across both runs.
 
+**Experiment 03 (hard mutations)**: We extended the analysis to three execution-dependent
+mutation types (wrong_variable, deleted_accumulator, swapped_arguments) that require
+simulating program execution to detect, rather than reading syntactic tokens. A 3-class
+linear probe reaches **83.1% at bin 0** and **86.4% at bin 9** at layer 32 (random baseline
+33.3%, majority baseline 59.6%). Crucially, the *temporal rise* (+3.3 pp at L32) is nearly
+identical to the easy-mutation profile (+2.6 pp), suggesting the representation does not
+dynamically compute more execution-dependent information during generation than it does for
+syntactically-visible mutations. The CCS direction on hard-mutation pairs achieves
+**94.3% test accuracy** at layer 32, matching the easy-mutation CCS quality and confirming
+the layer-32 buggy/original direction is robust across mutation semantics.
+
+**Experiment 04 (bug-only, methodological fix)**: The original dataset included original
+samples with the contradictory prompt "this code has a bug" despite no actual output
+difference — a confound for `will_be_correct` probes. Re-running with `include_originals=False`
+(N=830 buggy-only, pass@1=60.5%) yields a `will_be_correct` probe that rises from
+**74.9% → 91.8%** at layer 32 across generation (rise +16.9 pp), compared to +12.5 pp
+in the mixed dataset. The cleaner setting shows a steeper rise, consistent with the
+confound having attenuated the signal in the original analysis. The endpoint accuracy
+(~91.8%) is unchanged, confirming the layer-32 program-fate representation is robust
+to the methodological fix.
+
 ---
 
 ## 1. Motivation and Research Questions
@@ -664,6 +685,221 @@ confirming the Iteration 1 CCS finding was not inflated by direction-test leakag
 
 The `ccs_split.json` (577/253 split) is used by the Iteration 2 steering run (Section 3.6
 update below) to ensure the causal evaluation uses only held-out programs.
+
+---
+
+### 3.10 Experiment 03: Hard Mutations — execution-requiring bug types
+
+**Motivation**: The easy mutation types (off-by-one, condition flip, wrong comparator,
+wrong operator) all produce mutations that are syntactically visible in the prompt code
+— the changed token is directly readable. This means even the *early-bin* probe accuracy
+reflects prompt-reading rather than active computation. Hard mutation types require the
+model to *simulate execution* to determine which variable or accumulator is affected:
+
+- **`wrong_variable`**: The return statement references a different local variable than
+  the correct one (e.g., `return count` when correct is `return result`). Identifying
+  this requires knowing which variable accumulates the intended quantity.
+- **`deleted_accumulator`**: An augmented assignment (`+=`, `-=`, etc.) inside a loop
+  body is removed entirely. Detecting this requires tracing loop semantics.
+- **`swapped_arguments`**: The first two positional arguments of a function call are
+  transposed. Identifying this requires knowing argument order semantics.
+
+Hard mutations are present in N=312 samples (559 buggy variants, but some without
+valid hard mutation_type in the index; 35 deleted_accumulator / 91 swapped_arguments /
+186 wrong_variable = 312 used in probe).
+
+**Script**: `interp/scripts/bug_hard_analysis.sh` →
+`interp.bug_trace.analysis.probe_content traj_dir=interp-bug-trajectories-hard`
+
+**Infrastructure note**: The initial hard extraction (8 GPUs, `num_cuda_graphs=0`)
+produced empty `trajectory: {}` dicts — this is the CUDA graph bypass issue described
+in the infrastructure section. All 559 hard trajectories were re-extracted using
+prefill-based re-extraction (`run_bug_reextract.py`, job 16115593). After re-extraction:
+Updated=155, Total=559/559, Still empty=0. Full activation data confirmed for all samples.
+
+#### 3.10.1 mutation_type Probe (3-class: hard only)
+
+**Class distribution**:
+- `wrong_variable`: 186 (59.6%), `swapped_arguments`: 91 (29.2%), `deleted_accumulator`: 35 (11.2%)
+- Random baseline: 0.333, Majority baseline: 0.596
+
+**Confound check**: All classes share identical prompt framing ("this code has a bug").
+The distinction between classes lies in the *type* of code change, not in the prompt
+template. A permutation baseline (5 shuffled-label repeats) gives ~0.40 at all layers.
+
+**Results** (val_acc across 10 time bins):
+
+| Layer | bin0  | bin1  | bin2  | bin3  | bin4  | bin5  | bin6  | bin7  | bin8  | bin9  | perm_bl | rise    |
+|-------|-------|-------|-------|-------|-------|-------|-------|-------|-------|-------|---------|---------|
+| 16    | 0.683 | 0.729 | 0.748 | 0.757 | 0.735 | 0.751 | 0.769 | 0.743 | 0.774 | 0.790 | 0.420   | +0.107  |
+| 32    | 0.831 | 0.838 | 0.849 | 0.862 | 0.850 | 0.850 | 0.855 | 0.848 | 0.860 | 0.864 | 0.412   | +0.033  |
+| 48    | 0.796 | 0.807 | 0.799 | 0.811 | 0.787 | 0.813 | 0.806 | 0.806 | 0.823 | 0.816 | 0.397   | +0.020  |
+| 63    | 0.711 | 0.724 | 0.700 | 0.706 | 0.703 | 0.718 | 0.720 | 0.664 | 0.738 | 0.715 | 0.392   | +0.004  |
+
+**Comparison with easy mutations (5-class, Section 3.9.1)**:
+
+| Layer | Easy bin0 | Easy bin9 | Easy rise | Hard bin0 | Hard bin9 | Hard rise | Δ rise  |
+|-------|-----------|-----------|-----------|-----------|-----------|-----------|---------|
+| 16    | 0.474     | 0.545     | +0.071    | 0.683     | 0.790     | +0.107    | +0.036  |
+| 32    | 0.589     | 0.615     | +0.026    | 0.831     | 0.864     | +0.033    | +0.007  |
+| 48    | 0.548     | 0.567     | +0.018    | 0.796     | 0.816     | +0.020    | +0.002  |
+| 63    | 0.469     | 0.490     | +0.021    | 0.711     | 0.715     | +0.004    | -0.017  |
+
+**Interpretation**: Three findings stand out:
+
+1. **High early-bin accuracy for hard mutations** (L32 bin0 = 0.831 vs easy bin0 = 0.589).
+   This is initially surprising since hard mutations were designed to be execution-dependent.
+   However, the 3-class structure is strongly imbalanced: `wrong_variable` alone comprises
+   59.6% of samples (majority baseline = 0.596). The probe may be largely exploiting this
+   imbalance at early bins rather than encoding execution-dependent content. The permutation
+   baseline (0.412) is also higher than for easy mutations (0.225–0.305), consistent with
+   the probe having less room to improve.
+
+2. **Temporal rise is similar to easy mutations** (+0.033 at L32 vs +0.026 for easy).
+   Neither profile is strongly rising. The flat-to-mildly-rising pattern holds for hard
+   mutations just as for easy ones. This suggests that for hard mutations too, the
+   representation is dominated by static prompt-reading rather than dynamic computation
+   of execution-dependent information.
+
+3. **Layer 32 again dominates** (0.831–0.864 vs 0.683–0.790 at L16), consistent with
+   all prior analyses identifying L32 as the primary program-encoding locus.
+
+**Scope and caveats**: The 3-class imbalance (59.6% majority) makes interpretations
+difficult. A balanced subsample (n=35 per class, all three types included) would give a
+cleaner picture but would reduce N significantly. The key negative finding is that hard
+mutations do *not* show a substantially larger temporal rise than easy mutations, contrary
+to the hypothesis that execution-requiring detection should show more dynamic computation.
+This could mean: (a) the model encodes some distinguishing syntactic signal even for
+"hard" mutations, (b) execution-requiring detection saturates early due to class imbalance,
+or (c) the linear probe does not capture the computation that does occur.
+
+#### 3.10.2 CCS: buggy/original contrast on hard dataset
+
+**Dataset**: 189 train pairs / 88 test pairs (70/30 split by original_id).
+Hard trajectories only (wrong_variable, deleted_accumulator, swapped_arguments).
+
+**Results** (using mean-pooled trajectory representations):
+
+| Layer | Train acc | Test acc |
+|-------|-----------|----------|
+| 16    | 0.894     | 0.750    |
+| 32    | 0.968     | **0.943**|
+| 48    | 0.937     | 0.932    |
+| 63    | 0.910     | 0.864    |
+
+**Last-quarter representations** (bins 7–9 only, captures end-of-reasoning signal):
+
+| Layer | Train acc | Test acc |
+|-------|-----------|----------|
+| 16    | 0.841     | 0.739    |
+| 32    | 0.894     | 0.761    |
+| 48    | 0.857     | 0.807    |
+| 63    | 0.873     | 0.795    |
+
+**Interpretation**: The CCS direction separates original from buggy at **94.3% test
+accuracy** at layer 32 (mean pooled), comparable to the easy-mutation CCS (89.7% test,
+Section 3.9.2). This is the key finding: even for "hard" mutations that require execution
+reasoning to detect, the layer-32 residual stream contains a linearly separable
+buggy/original direction with nearly identical separation quality to easy mutations.
+
+The last-quarter results show a drop vs mean-pooled (L32: 76.1% vs 94.3% test), with
+L48 showing the best last-quarter performance (80.7%). This is consistent with the
+hypothesis that the buggy/original signal becomes more distributed across layers
+as generation progresses into deeper reasoning steps.
+
+The test accuracy generalization (mean-pooled: train 0.968 → test 0.943) is strong
+and comparable to the easy-mutation result (0.924 → 0.897), confirming that the
+CCS direction on hard mutations is not a training-set artifact.
+
+#### 3.10.3 Change Point Analysis (T*)
+
+**Method**: Inter-step cosine distance `1 - cos_sim(h_T, h_{T-1})` per trajectory.
+T* = argmax. Relative position T*/T reported.
+
+| Layer | Mean T*/T | Std   | N     |
+|-------|-----------|-------|-------|
+| 16    | 0.457     | 0.325 | 559   |
+| 32    | 0.492     | 0.328 | 559   |
+| 48    | 0.681     | 0.332 | 559   |
+| 63    | 0.607     | 0.316 | 559   |
+
+Most frequent tokens at T* (layer 32 / layer 16): function words and punctuation dominate
+(` `, ` of`, `2`, `,`, `1`, `'`, ` should`, ` the`, ` return`, `` ` ``). No strong
+concentration on specific semantic tokens, consistent with the diffuse change-point
+finding for easy mutations.
+
+---
+
+### 3.11 Experiment 04: Bug-Only Trajectories (Methodological Fix)
+
+**Motivation**: The original mixed-dataset experiment (Section 3.3) included both buggy
+and original samples in the same trajectory dump. Original samples received the prompt
+"The following Python code has a bug: [original code]" despite having *identical*
+wrong/correct output fields — a contradictory framing. This creates a confound: the model
+may encode `will_be_correct` not by reasoning about the fix, but by detecting the
+incoherent framing in the prompt (e.g., "it says bug but the outputs match").
+
+**Fix**: Re-run extraction with `include_originals=False` → dump dir
+`interp-bug-trajectories-track_a-bugonly/`. Analyse only `will_be_correct` (no CCS,
+no `is_buggy` — both require original/buggy contrast which is absent in bugonly mode).
+
+**Dataset**: 830 buggy-only samples (all 5 easy mutation types), pass@1 = 60.5% (502/830
+fixed correctly). Majority baseline for `will_be_correct` = 60.5%.
+
+**Scripts**: `bug_bugonly_extract.sh` → `bug_bugonly_reextract.sh` (prefill, 830/830
+updated) → `bug_bugonly_analysis.sh` (job 16120996, probe_temporal step completed;
+visualize step failed on matplotlib LaTeX issue, analytical results intact).
+
+#### 3.11.1 will_be_correct Probe (binary: fixed correctly vs. not)
+
+**Results** (val_acc across 10 time bins, buggy-only samples):
+
+| Layer | bin0  | bin1  | bin2  | bin3  | bin4  | bin5  | bin6  | bin7  | bin8  | bin9  | rise    |
+|-------|-------|-------|-------|-------|-------|-------|-------|-------|-------|-------|---------|
+| 16    | 0.719 | 0.835 | 0.855 | 0.863 | 0.869 | 0.863 | 0.869 | 0.878 | 0.864 | 0.903 | +0.183  |
+| 32    | 0.749 | 0.839 | 0.871 | 0.879 | 0.888 | 0.886 | 0.883 | 0.888 | 0.901 | **0.918** | +0.169 |
+| 48    | 0.733 | 0.827 | 0.853 | 0.863 | 0.870 | 0.868 | 0.869 | 0.878 | 0.887 | 0.910 | +0.177  |
+| 63    | 0.681 | 0.807 | 0.812 | 0.856 | 0.845 | 0.862 | 0.880 | 0.883 | 0.890 | 0.906 | +0.224  |
+
+**Comparison with mixed-dataset result (Section 3.3, L32)**:
+
+| Condition | bin0  | bin9  | rise   | Majority baseline |
+|-----------|-------|-------|--------|-------------------|
+| Mixed (buggy + original, N=1280) | 0.792 | 0.917 | +0.125 | ~66% |
+| **Bug-only (N=830)**             | 0.749 | 0.918 | **+0.169** | 60.5% |
+
+**Interpretation**: Three findings:
+
+1. **Lower bin0, same bin9**: In the mixed dataset, bin0 accuracy was 79.2% — higher than
+   the bugonly result (74.9% at L32). This gap is explained by the confound: in the mixed
+   dataset, the `is_buggy=False` samples (originals with coherent prompts) are easier to
+   predict as `will_be_correct=True`. Removing this shortcut lowers bin0 accuracy. By bin9,
+   both conditions converge at ~91.8%, suggesting the *endpoint* representation is the same.
+
+2. **Larger temporal rise without the confound**: The bugonly rise (+16.9 pp at L32) is
+   substantially larger than the mixed-dataset rise (+12.5 pp). This supports the
+   interpretation that the mixed-dataset rise was *attenuated* by the contradictory-prompt
+   originals (which had near-constant representations throughout generation). In the clean
+   bugonly setting, the probe shows a steeper, more consistent rise as the model builds its
+   "will I fix this?" belief through reasoning.
+
+3. **All layers show strong rising profiles**: Unlike the mixed dataset where layer 32 was
+   clearly dominant, the bugonly result shows all four layers (16, 32, 48, 63) rising
+   strongly by +0.17 to +0.22 pp. Layer 32 still achieves the highest absolute accuracy
+   (91.8% at bin9), but the pattern is more distributed — consistent with the hypothesis
+   that the confound in the mixed dataset artificially amplified layer 32's relative advantage.
+
+4. **Bin1 jump is large (+0.116 pp from bin0 to bin1 at L32)**: The representation
+   becomes substantially more informative in the first 10% of generation. This is consistent
+   with the model quickly establishing a "disposition" toward the fix (or failure) based
+   on early reasoning tokens (e.g., identifying the bug type in the first sentence of
+   chain-of-thought).
+
+**Scope**: The `will_be_correct` label is still partially confounded by prompt complexity
+(harder programs may produce both longer reasoning and lower correctness). A conditional
+analysis controlling for prompt length would be the cleanest test. The permutation baseline
+was not computed for this run (it requires additional passes); the majority baseline (60.5%)
+provides the relevant comparison: all layers substantially exceed it from bin0 onward.
 
 ---
 

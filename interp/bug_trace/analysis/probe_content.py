@@ -35,13 +35,23 @@ from cwm.common.params import load_from_cli
 
 logger = logging.getLogger(__name__)
 
-MUTATION_TYPES = [
+EASY_MUTATION_TYPES = [
     "condition_flip",
     "off_by_one_minus",
     "off_by_one_plus",
     "wrong_comparator",
     "wrong_operator",
 ]
+
+HARD_MUTATION_TYPES = [
+    "deleted_accumulator",
+    "swapped_arguments",
+    "wrong_variable",
+]
+
+# Default: all known mutation types. The probe will auto-restrict to whichever
+# types are actually present in the dataset (see run_probe_content below).
+MUTATION_TYPES = EASY_MUTATION_TYPES + HARD_MUTATION_TYPES
 MUTATION_TO_IDX = {m: i for i, m in enumerate(MUTATION_TYPES)}
 
 
@@ -139,29 +149,45 @@ def run_probe_content(args: ProbeContentArgs) -> None:
 
     traj_subdir = traj_path / "trajectories"
 
+    # Determine which mutation types are present in this dataset
+    from collections import Counter
+    all_types_in_data = Counter(
+        m.get("mutation_type", "none")
+        for m in index
+        if m.get("is_buggy", False)
+    )
+    present_types = sorted([t for t in all_types_in_data if t in MUTATION_TO_IDX and all_types_in_data[t] > 0])
+    if not present_types:
+        logger.error("No known mutation types found in dataset. Check mutation_type values.")
+        return
+    logger.info(f"Mutation types present in dataset: {present_types}")
+
+    # Build a local mapping restricted to present types
+    local_types = present_types
+    local_to_idx = {m: i for i, m in enumerate(local_types)}
+
     # Only use buggy samples with known mutation_type
     buggy_index = [
         m for m in index
-        if m.get("is_buggy", False) and m.get("mutation_type", "none") in MUTATION_TO_IDX
+        if m.get("is_buggy", False) and m.get("mutation_type", "none") in local_to_idx
     ]
     logger.info(f"Buggy samples with known mutation_type: {len(buggy_index)}")
 
     # Class distribution and majority baseline
-    from collections import Counter
     counts = Counter(m["mutation_type"] for m in buggy_index)
     total = sum(counts.values())
     print("\n=== Class distribution (mutation_type) ===")
-    for mt in MUTATION_TYPES:
+    for mt in local_types:
         n = counts.get(mt, 0)
         print(f"  {mt:<25} {n:>4} ({100*n/max(total,1):.1f}%)")
-    majority_baseline = max(counts.values()) / total if total > 0 else 0.2
-    random_baseline = 1.0 / len(MUTATION_TYPES)
+    majority_baseline = max(counts.values()) / total if total > 0 else 1.0 / len(local_types)
+    random_baseline = 1.0 / len(local_types)
     print(f"  Random baseline:   {random_baseline:.3f}")
     print(f"  Majority baseline: {majority_baseline:.3f}")
 
     # Prompt length per class (using n_prompt_tokens from .pt file)
     print("\n=== Prompt length by mutation_type (confound check) ===")
-    length_by_type: dict[str, list] = {mt: [] for mt in MUTATION_TYPES}
+    length_by_type: dict[str, list] = {mt: [] for mt in local_types}
     for meta in buggy_index:
         pt = traj_subdir / f"{meta['sample_id']}.pt"
         if pt.exists():
@@ -169,12 +195,12 @@ def run_probe_content(args: ProbeContentArgs) -> None:
             n_prompt = sample.get("n_prompt_tokens", 0)
             if n_prompt > 0:
                 length_by_type[meta["mutation_type"]].append(n_prompt)
-    for mt in MUTATION_TYPES:
+    for mt in local_types:
         ls = length_by_type[mt]
         if ls:
             print(f"  {mt:<25} mean={sum(ls)/len(ls):.0f} tokens (n={len(ls)})")
 
-    n_classes = len(MUTATION_TYPES)
+    n_classes = len(local_types)
     heatmap: dict = {}
 
     print(f"\n=== Probe heatmap: mutation_type ({n_classes}-class) ===")
@@ -184,7 +210,6 @@ def run_probe_content(args: ProbeContentArgs) -> None:
     print("  | perm_bl")
 
     # Process one layer at a time to avoid OOM
-    # (830 samples × ~256 steps × 6144 dims × float32 ≈ 5 GB per layer)
     for layer in args.layers:
         h_list: list = []
         label_list: list = []
@@ -197,7 +222,7 @@ def run_probe_content(args: ProbeContentArgs) -> None:
                 continue
             sample = torch.load(pt, map_location="cpu", weights_only=False)
             traj = sample.get("trajectory", {})
-            label = MUTATION_TO_IDX[meta["mutation_type"]]
+            label = local_to_idx[meta["mutation_type"]]
             h_traj = traj.get(layer)
             if h_traj is None:
                 h_traj = traj.get(str(layer))
@@ -261,7 +286,7 @@ def run_probe_content(args: ProbeContentArgs) -> None:
 
     out = traj_path / "probe_content_mutation_type.pt"
     torch.save({"heatmap": heatmap, "args": vars(args),
-                "mutation_types": MUTATION_TYPES,
+                "mutation_types": local_types,
                 "class_counts": dict(counts),
                 "majority_baseline": majority_baseline,
                 "random_baseline": random_baseline}, out)
