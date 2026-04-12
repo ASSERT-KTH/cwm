@@ -49,17 +49,41 @@ with suppress(ModuleNotFoundError, ImportError):
 
 @dataclass
 class ActivationStore:
-    """Accumulates hidden-state captures across decode steps."""
+    """Accumulates hidden-state captures across decode steps.
+
+    Multi-turn support: call next_turn() before each g.generate() call to
+    increment current_turn.  Every activation captured during that call will
+    have its turn index recorded in turn_indices (parallel to positions).
+    """
 
     layers: list[int]
     capture_token_ids: list[int] | None  # None = capture all positions
     data: dict[int, list[torch.Tensor]] = field(default_factory=dict)
     positions: list[int] = field(default_factory=list)
+    # Parallel to positions: which turn (g.generate() call) each capture is from.
+    turn_indices: list[int] = field(default_factory=list)
+    # Incremented by next_turn(); read by _capture_at_layer().
+    current_turn: int = 0
     enabled: bool = True
+    # Sequence-position range for this trajectory's current generate call.
+    # Set to (len(traj.context), len(traj.context) + max_gen) before each
+    # g.generate() so that when the TP batch contains multiple trajectories
+    # from different ranks, we only capture positions that belong to *this*
+    # trajectory and not the TP partner's.
+    seqlen_start: int | None = None
+    seqlen_end: int | None = None
+
+    def next_turn(self) -> None:
+        """Advance the turn counter.  Call once before each g.generate() call."""
+        self.current_turn += 1
 
     def clear(self) -> None:
         self.data.clear()
         self.positions.clear()
+        self.turn_indices.clear()
+        self.current_turn = 0
+        self.seqlen_start = None
+        self.seqlen_end = None
 
     def get_activations(self, layer: int) -> torch.Tensor | None:
         """Return [n_captured, dim] tensor for a layer, or None."""
@@ -165,12 +189,14 @@ def _capture_at_layer(
         store.data[layer_idx] = []
     store.data[layer_idx].append(captured)
 
-    # Record sequence positions
+    # Record sequence positions and the current turn index
+    n_captured = captured.shape[0]
     if q_seqpos.numel() > 1:
         pos_vals = q_seqpos[indices].tolist()
     else:
-        pos_vals = [int(q_seqpos.item())] * len(indices)
+        pos_vals = [int(q_seqpos.item())] * n_captured
     store.positions.extend(pos_vals)
+    store.turn_indices.extend([store.current_turn] * n_captured)
 
 
 def _apply_steering_at_layer(

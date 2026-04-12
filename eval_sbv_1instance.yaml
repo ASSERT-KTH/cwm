@@ -1,0 +1,27 @@
+# 1-instance SWEbench eval config.
+# Derived from evals/configs/eval_sbv.yaml.
+# Only change from original: num_rollout_threads reduced from 10 to 1
+# (parallelism only — does not affect individual run quality).
+num_rollout_threads: 1
+dump_mode: minimal
+
+gen_args:
+  use_sampling: true
+  vocab_parallel: true
+  loss_parallel: true
+  temperature: 1.0
+  top_p: 0.95
+  max_batch: 128
+  # Sized for 80GB GPU memory (A100-SXM4-80GB)
+  max_seq: 332800
+  host_cache_gb: 20
+  tp_size: 2
+
+tasks:
+  - env_config: swerl_tool_env:think_tag:modal:eval
+    reward_fn: similarities
+    path: /proj/assert-berzelius/users/x_andaf/cwm/swebench_1instance.jsonl
+    samples_per_prompt: 1
+    metrics_spec:
+      pass:
+        - "@1"
