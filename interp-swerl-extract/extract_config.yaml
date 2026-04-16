@@ -1,0 +1,60 @@
+dump_dir: interp-swerl-extract
+dump_mode: minimal
+keep_start_args:
+- task_id
+- instance_id
+perf_log_freq: 60.0
+checkpoint_dir: ./model_weights/cwm
+metric_log_dir: interp-swerl-extract
+seed: 42
+num_rollout_threads: 2
+data_queue_size: 1000000
+global_step: null
+tasks:
+- env_config: swerl_tool_env:think_tag:modal:eval
+  reward_fn: similarities
+  path: /proj/assert-berzelius/users/x_andaf/cwm/swebench_verified_swerl.jsonl
+  init_args: null
+  samples_per_prompt: 1
+  metrics_spec:
+    pass:
+    - '@1'
+run_metrics_aggregation: true
+gen_args:
+  use_sampling: true
+  temperature: 1.0
+  top_p: 0.95
+  logprobs: false
+  prompt_logprobs: false
+  max_batch: 128
+  max_seq: 332800
+  max_gen: null
+  host_cache_gb: 20.0
+  num_cuda_graphs: 16
+  cache_block: 256
+  max_prefill: 4096
+  min_prefill: 512
+  min_prefill_batch: 8
+  prefill_gb: 2.0
+  gpu_gb: 74.0
+  sync_freq: 10
+  handover_frequency: 4
+  tp_size: 2
+  vocab_parallel: true
+  loss_parallel: true
+setup:
+  spawn_method: forkserver
+  torch_init_timeout: 600
+  cuda_matmul_allow_tf32: false
+  cuda_allow_bf16_reduced_precision_reduction: true
+  autograd_detect_anomaly: false
+tokenizer: null
+log_level: info
+max_exceptions: 3
+layers:
+- 32
+stride: 2
+n_instances: -1
+resume: true
+shard_id: 3
+n_shards: 4

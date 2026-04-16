@@ -3,6 +3,7 @@
 # All per-trajectory inference settings (max_seq, temperature, etc.) are unchanged.
 num_rollout_threads: 1
 dump_mode: minimal
+stride: 2
 
 gen_args:
   use_sampling: true

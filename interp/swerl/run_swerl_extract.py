@@ -102,6 +102,9 @@ class ExtractArgs(RLEvalArgs):
     n_instances: int = -1
     # Skip instances whose .pt file already exists in save_dir (for resuming)
     resume: bool = True
+    # Shard index (0-based) and total shard count for parallel jobs
+    shard_id: int = 0
+    n_shards: int = 1
 
 
 # ---------------------------------------------------------------------------
@@ -139,11 +142,13 @@ def _rollout_with_capture(
     start_args: dict,
     save_dir: Path,
     instance_id: str,
+    tp_rank: int = 0,
 ) -> dict | None:
     """Run one trajectory with activation capture.
 
     Returns a metadata dict (without the large activation tensors) on success,
-    or None on failure.  The full .pt file is written to save_dir.
+    or None on failure.  The full .pt file is written to save_dir by TP rank 0
+    only; other TP ranks participate in the forward pass but skip the save.
     """
     store = ActivationStore(
         layers=args.layers,
@@ -222,8 +227,20 @@ def _rollout_with_capture(
         for k, v in labels.items()
     }
 
+    # Only the TP-rank-0 worker within each DP group writes the file.
+    # Other TP ranks have participated in the forward pass (all-reduce is
+    # done) but their shard of the hidden state is identical to rank 0's —
+    # writing from all ranks would produce duplicate / empty files.
+    if tp_rank != 0:
+        return {"instance_id": instance_id, "outcome": outcome, "n_turns": turn_idx}
+
     save_dir.mkdir(parents=True, exist_ok=True)
     out_path = save_dir / f"{instance_id}.pt"
+    # Save the full context token IDs so activations can be mapped back to
+    # vocabulary tokens: context_tokens[positions[k]] gives the token ID for
+    # the k-th captured activation.
+    context_tokens = torch.tensor(traj.context, dtype=torch.int32)
+
     torch.save(
         {
             "instance_id": instance_id,
@@ -235,6 +252,7 @@ def _rollout_with_capture(
             "turn_indices": turn_indices_strided,
             "labels": labels_strided,
             "activations": activations_strided,
+            "context_tokens": context_tokens,
             "stride": stride,
             "layers": args.layers,
         },
@@ -260,6 +278,7 @@ def rollout_extract(
     done_queue: queue.Queue,
     dump_queue: moodist.Queue,
     save_dir: Path,
+    tp_rank: int = 0,
 ) -> None:
     while True:
         data = data_queue.get_object()
@@ -276,7 +295,7 @@ def rollout_extract(
         instance_id = start_args.get("instance_id", str(data.src))
 
         logger.info(f"Extracting {instance_id}")
-        meta = _rollout_with_capture(args, env, rewardfn, g, start_args, save_dir, instance_id)
+        meta = _rollout_with_capture(args, env, rewardfn, g, start_args, save_dir, instance_id, tp_rank=tp_rank)
         if meta is not None:
             dump_queue.put_object(meta)
         else:
@@ -352,6 +371,19 @@ def run_extraction(args: ExtractArgs) -> None:
             # Map first (produces TaskIdxDatum with .val/.src), then filter
             all_items = list(Dataset.from_jsonl(dataset_path).map(to_datum))
 
+            # Shard: partition by full-list index BEFORE resume filter so that
+            # each instance always belongs to the same shard regardless of when
+            # the job starts or how many files already exist.
+            if args.n_shards > 1:
+                all_items = [
+                    item for i, item in enumerate(all_items)
+                    if i % args.n_shards == args.shard_id
+                ]
+                logger.info(
+                    f"Shard {args.shard_id}/{args.n_shards}: "
+                    f"{len(all_items)} instances assigned to this shard"
+                )
+
             # Resume: skip instances whose .pt file already exists
             if args.resume:
                 n_before = len(all_items)
@@ -365,7 +397,7 @@ def run_extraction(args: ExtractArgs) -> None:
                     f"{len(all_items)} remaining"
                 )
 
-            # Limit to n_instances if set (applied after resume filter)
+            # Limit to n_instances if set (applied after shard + resume filter)
             if args.n_instances > 0:
                 all_items = all_items[: args.n_instances]
 
@@ -401,6 +433,7 @@ def run_extraction(args: ExtractArgs) -> None:
                 done_queue=done_queue,
                 dump_queue=dump_queue,
                 save_dir=save_dir,
+                tp_rank=tp_group.rank(),
                 exc_queue=exc_queue,
             ),
         )
