@@ -77,8 +77,9 @@ def bin_by_tool_call_index(
 ) -> list[Bucket]:
     """Group activations into n_buckets by normalised turn index.
 
-    For each turn, only the *last* captured activation in that turn is used
-    (it represents the model's state at the moment it committed to a tool call).
+    Bucket k contains all token activations captured during turn k (i.e. after
+    the (k-1)-th tool response and before the k-th tool response).  All tokens
+    from a turn are included, not just the last one.
     Turn 0 → bucket 0; last turn → bucket (n_buckets - 1).
     Returns a list of n_buckets (acts, labels) pairs.
     """
@@ -94,11 +95,11 @@ def bin_by_tool_call_index(
             idxs = [i for i, t in enumerate(record.turn_indices) if t == turn_idx]
             if not idxs:
                 continue
-            last_idx = idxs[-1]
             frac = turn_idx / denom
             bucket = min(int(frac * n_buckets), n_buckets - 1)
-            buckets[bucket][0].append(acts[last_idx])
-            buckets[bucket][1].append(label)
+            for i in idxs:
+                buckets[bucket][0].append(acts[i])
+                buckets[bucket][1].append(label)
     return buckets
 
 
@@ -109,7 +110,8 @@ def pool_by_stage(
 ) -> dict[str, Bucket]:
     """Group activations by tool-call stage.
 
-    For each turn, uses the *last* captured activation in that turn.
+    All token activations captured during a turn are included (not just the
+    last one), labelled with that turn's stage.
     Stages with fewer than min_samples activations across all records are
     excluded (they would produce unreliable probe estimates).
 
@@ -129,11 +131,11 @@ def pool_by_stage(
             idxs = [i for i, t in enumerate(record.turn_indices) if t == turn_idx]
             if not idxs:
                 continue
-            last_idx = idxs[-1]
             if stage not in pools:
                 pools[stage] = ([], [])
-            pools[stage][0].append(acts[last_idx])
-            pools[stage][1].append(label)
+            for i in idxs:
+                pools[stage][0].append(acts[i])
+                pools[stage][1].append(label)
 
     return {
         stage: data
