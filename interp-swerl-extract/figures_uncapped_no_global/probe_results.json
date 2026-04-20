@@ -1,0 +1,186 @@
+{
+  "layer": 32,
+  "n_records": 485,
+  "n_pass": 250,
+  "token_position": [
+    {
+      "n": 242297,
+      "majority": 0.5273362856329216,
+      "val_acc": 0.557894302399967,
+      "skipped": false,
+      "bin": 0
+    },
+    {
+      "n": 254867,
+      "majority": 0.5293388316259069,
+      "val_acc": 0.5623369234692877,
+      "skipped": false,
+      "bin": 1
+    },
+    {
+      "n": 252885,
+      "majority": 0.5253731933487553,
+      "val_acc": 0.5688751804179766,
+      "skipped": false,
+      "bin": 2
+    },
+    {
+      "n": 238633,
+      "majority": 0.521474397924847,
+      "val_acc": 0.5718266772828228,
+      "skipped": false,
+      "bin": 3
+    },
+    {
+      "n": 232712,
+      "majority": 0.5236687407611125,
+      "val_acc": 0.5750075200893816,
+      "skipped": false,
+      "bin": 4
+    },
+    {
+      "n": 221645,
+      "majority": 0.5104829795393535,
+      "val_acc": 0.5788535721536692,
+      "skipped": false,
+      "bin": 5
+    },
+    {
+      "n": 206506,
+      "majority": 0.5174086951468723,
+      "val_acc": 0.5924311760005812,
+      "skipped": false,
+      "bin": 6
+    },
+    {
+      "n": 188641,
+      "majority": 0.5294289152411193,
+      "val_acc": 0.5923717133163698,
+      "skipped": false,
+      "bin": 7
+    },
+    {
+      "n": 172984,
+      "majority": 0.545495537159506,
+      "val_acc": 0.5857035495432998,
+      "skipped": false,
+      "bin": 8
+    },
+    {
+      "n": 412361,
+      "majority": 0.6290677343395714,
+      "val_acc": 0.5806091764477641,
+      "skipped": false,
+      "bin": 9
+    }
+  ],
+  "tool_call_index": [
+    {
+      "n": 254082,
+      "majority": 0.5730708983713919,
+      "val_acc": 0.5429982682619647,
+      "skipped": false,
+      "bin": 0
+    },
+    {
+      "n": 275525,
+      "majority": 0.589079030940931,
+      "val_acc": 0.5604573087741584,
+      "skipped": false,
+      "bin": 1
+    },
+    {
+      "n": 256030,
+      "majority": 0.5493301566222708,
+      "val_acc": 0.5517908057649494,
+      "skipped": false,
+      "bin": 2
+    },
+    {
+      "n": 210089,
+      "majority": 0.5557121029658859,
+      "val_acc": 0.5683413856296261,
+      "skipped": false,
+      "bin": 3
+    },
+    {
+      "n": 184794,
+      "majority": 0.5446930095132959,
+      "val_acc": 0.5712971481140754,
+      "skipped": false,
+      "bin": 4
+    },
+    {
+      "n": 230181,
+      "majority": 0.5282625412175636,
+      "val_acc": 0.5528933877834739,
+      "skipped": false,
+      "bin": 5
+    },
+    {
+      "n": 233733,
+      "majority": 0.5079856075094231,
+      "val_acc": 0.5568176956317118,
+      "skipped": false,
+      "bin": 6
+    },
+    {
+      "n": 225722,
+      "majority": 0.5298331576009427,
+      "val_acc": 0.5515461633882687,
+      "skipped": false,
+      "bin": 7
+    },
+    {
+      "n": 267097,
+      "majority": 0.533379259220433,
+      "val_acc": 0.5533611636309178,
+      "skipped": false,
+      "bin": 8
+    },
+    {
+      "n": 286278,
+      "majority": 0.5651429729144398,
+      "val_acc": 0.5615230110907344,
+      "skipped": false,
+      "bin": 9
+    }
+  ],
+  "stage": {
+    "exploration": {
+      "n": 960329,
+      "majority": 0.5345011969856164,
+      "val_acc": 0.5454819982818316,
+      "skipped": false,
+      "stage": "exploration"
+    },
+    "editing": {
+      "n": 474818,
+      "majority": 0.5122025702479687,
+      "val_acc": 0.5434432357865695,
+      "skipped": false,
+      "stage": "editing"
+    },
+    "testing": {
+      "n": 363487,
+      "majority": 0.5503498061828896,
+      "val_acc": 0.5481106510585031,
+      "skipped": false,
+      "stage": "testing"
+    },
+    "other-bash": {
+      "n": 580421,
+      "majority": 0.5187458758384,
+      "val_acc": 0.5399279831845905,
+      "skipped": false,
+      "stage": "other-bash"
+    },
+    "submission": {
+      "n": 44476,
+      "majority": 0.5451029768864106,
+      "val_acc": 0.6211354693648117,
+      "skipped": false,
+      "stage": "submission"
+    }
+  }
+}

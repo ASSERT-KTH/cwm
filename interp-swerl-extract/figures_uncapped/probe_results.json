@@ -1,0 +1,369 @@
+{
+  "layer": 32,
+  "n_records": 485,
+  "n_pass": 250,
+  "token_position": [
+    {
+      "n": 242297,
+      "majority": 0.5273362856329216,
+      "val_acc": 0.5626405827606843,
+      "skipped": false,
+      "bin": 0
+    },
+    {
+      "n": 254867,
+      "majority": 0.5293388316259069,
+      "val_acc": 0.56416141879034,
+      "skipped": false,
+      "bin": 1
+    },
+    {
+      "n": 252885,
+      "majority": 0.5253731933487553,
+      "val_acc": 0.5677679577673647,
+      "skipped": false,
+      "bin": 2
+    },
+    {
+      "n": 238633,
+      "majority": 0.521474397924847,
+      "val_acc": 0.5732514771822487,
+      "skipped": false,
+      "bin": 3
+    },
+    {
+      "n": 232712,
+      "majority": 0.5236687407611125,
+      "val_acc": 0.5755016973916033,
+      "skipped": false,
+      "bin": 4
+    },
+    {
+      "n": 221645,
+      "majority": 0.5104829795393535,
+      "val_acc": 0.5800266191432245,
+      "skipped": false,
+      "bin": 5
+    },
+    {
+      "n": 206506,
+      "majority": 0.5174086951468723,
+      "val_acc": 0.5966441490520811,
+      "skipped": false,
+      "bin": 6
+    },
+    {
+      "n": 188641,
+      "majority": 0.5294289152411193,
+      "val_acc": 0.5907813825275657,
+      "skipped": false,
+      "bin": 7
+    },
+    {
+      "n": 172984,
+      "majority": 0.545495537159506,
+      "val_acc": 0.5870331830269395,
+      "skipped": false,
+      "bin": 8
+    },
+    {
+      "n": 412361,
+      "majority": 0.6290677343395714,
+      "val_acc": 0.5798210301678145,
+      "skipped": false,
+      "bin": 9
+    }
+  ],
+  "tool_call_index": [
+    {
+      "n": 254082,
+      "majority": 0.5730708983713919,
+      "val_acc": 0.5432344143576826,
+      "skipped": false,
+      "bin": 0
+    },
+    {
+      "n": 275525,
+      "majority": 0.589079030940931,
+      "val_acc": 0.5626349696034842,
+      "skipped": false,
+      "bin": 1
+    },
+    {
+      "n": 256030,
+      "majority": 0.5493301566222708,
+      "val_acc": 0.5496426200054682,
+      "skipped": false,
+      "bin": 2
+    },
+    {
+      "n": 210089,
+      "majority": 0.5557121029658859,
+      "val_acc": 0.5682937858485851,
+      "skipped": false,
+      "bin": 3
+    },
+    {
+      "n": 184794,
+      "majority": 0.5446930095132959,
+      "val_acc": 0.5708371665133395,
+      "skipped": false,
+      "bin": 4
+    },
+    {
+      "n": 230181,
+      "majority": 0.5282625412175636,
+      "val_acc": 0.5496133460769832,
+      "skipped": false,
+      "bin": 5
+    },
+    {
+      "n": 233733,
+      "majority": 0.5079856075094231,
+      "val_acc": 0.5530526676079237,
+      "skipped": false,
+      "bin": 6
+    },
+    {
+      "n": 225722,
+      "majority": 0.5298331576009427,
+      "val_acc": 0.5534068757752968,
+      "skipped": false,
+      "bin": 7
+    },
+    {
+      "n": 267097,
+      "majority": 0.533379259220433,
+      "val_acc": 0.5576293079241469,
+      "skipped": false,
+      "bin": 8
+    },
+    {
+      "n": 286278,
+      "majority": 0.5651429729144398,
+      "val_acc": 0.5630075975897302,
+      "skipped": false,
+      "bin": 9
+    }
+  ],
+  "stage": {
+    "exploration": {
+      "n": 960329,
+      "majority": 0.5345011969856164,
+      "val_acc": 0.5415926899747482,
+      "skipped": false,
+      "stage": "exploration"
+    },
+    "editing": {
+      "n": 474818,
+      "majority": 0.5122025702479687,
+      "val_acc": 0.5414740477870329,
+      "skipped": false,
+      "stage": "editing"
+    },
+    "testing": {
+      "n": 363487,
+      "majority": 0.5503498061828896,
+      "val_acc": 0.5480968953326822,
+      "skipped": false,
+      "stage": "testing"
+    },
+    "other-bash": {
+      "n": 580421,
+      "majority": 0.5187458758384,
+      "val_acc": 0.5417714758278488,
+      "skipped": false,
+      "stage": "other-bash"
+    },
+    "submission": {
+      "n": 44476,
+      "majority": 0.5451029768864106,
+      "val_acc": 0.6149522203485104,
+      "skipped": false,
+      "stage": "submission"
+    }
+  },
+  "global_probe": {
+    "token_position": [
+      {
+        "n": 3972,
+        "majority": 0.5108257804632427,
+        "val_acc": 0.5294561982154846,
+        "skipped": false,
+        "bin": 0
+      },
+      {
+        "n": 4138,
+        "majority": 0.526341227646206,
+        "val_acc": 0.5229579210281372,
+        "skipped": false,
+        "bin": 1
+      },
+      {
+        "n": 4185,
+        "majority": 0.5170848267622461,
+        "val_acc": 0.5230585336685181,
+        "skipped": false,
+        "bin": 2
+      },
+      {
+        "n": 3937,
+        "majority": 0.5189230378460757,
+        "val_acc": 0.5158750414848328,
+        "skipped": false,
+        "bin": 3
+      },
+      {
+        "n": 3817,
+        "majority": 0.5451925596017815,
+        "val_acc": 0.5237097144126892,
+        "skipped": false,
+        "bin": 4
+      },
+      {
+        "n": 3671,
+        "majority": 0.5251974938708799,
+        "val_acc": 0.5246526598930359,
+        "skipped": false,
+        "bin": 5
+      },
+      {
+        "n": 3450,
+        "majority": 0.5194202898550725,
+        "val_acc": 0.530434787273407,
+        "skipped": false,
+        "bin": 6
+      },
+      {
+        "n": 3082,
+        "majority": 0.5392602206359507,
+        "val_acc": 0.5369889736175537,
+        "skipped": false,
+        "bin": 7
+      },
+      {
+        "n": 2823,
+        "majority": 0.5455189514700673,
+        "val_acc": 0.5391427278518677,
+        "skipped": false,
+        "bin": 8
+      },
+      {
+        "n": 6925,
+        "majority": 0.6288808664259928,
+        "val_acc": 0.5210108160972595,
+        "skipped": false,
+        "bin": 9
+      }
+    ],
+    "tool_call_index": [
+      {
+        "n": 4166,
+        "majority": 0.585453672587614,
+        "val_acc": 0.520403265953064,
+        "skipped": false,
+        "bin": 0
+      },
+      {
+        "n": 4535,
+        "majority": 0.5995589856670341,
+        "val_acc": 0.5270121097564697,
+        "skipped": false,
+        "bin": 1
+      },
+      {
+        "n": 4210,
+        "majority": 0.5553444180522565,
+        "val_acc": 0.5130641460418701,
+        "skipped": false,
+        "bin": 2
+      },
+      {
+        "n": 3393,
+        "majority": 0.5617447686413204,
+        "val_acc": 0.5122310519218445,
+        "skipped": false,
+        "bin": 3
+      },
+      {
+        "n": 2978,
+        "majority": 0.5231699126930826,
+        "val_acc": 0.5010073781013489,
+        "skipped": false,
+        "bin": 4
+      },
+      {
+        "n": 3908,
+        "majority": 0.5365916069600819,
+        "val_acc": 0.5261002779006958,
+        "skipped": false,
+        "bin": 5
+      },
+      {
+        "n": 3858,
+        "majority": 0.5062208398133748,
+        "val_acc": 0.5287714004516602,
+        "skipped": false,
+        "bin": 6
+      },
+      {
+        "n": 3677,
+        "majority": 0.5322273592602665,
+        "val_acc": 0.54555344581604,
+        "skipped": false,
+        "bin": 7
+      },
+      {
+        "n": 4472,
+        "majority": 0.5203488372093024,
+        "val_acc": 0.5411449074745178,
+        "skipped": false,
+        "bin": 8
+      },
+      {
+        "n": 4803,
+        "majority": 0.5617322506766604,
+        "val_acc": 0.5323755741119385,
+        "skipped": false,
+        "bin": 9
+      }
+    ],
+    "stage": {
+      "editing": {
+        "n": 7808,
+        "majority": 0.5172899590163934,
+        "val_acc": 0.5256147384643555,
+        "skipped": false,
+        "stage": "editing"
+      },
+      "exploration": {
+        "n": 15726,
+        "majority": 0.5401882233244308,
+        "val_acc": 0.5293145179748535,
+        "skipped": false,
+        "stage": "exploration"
+      },
+      "other-bash": {
+        "n": 9687,
+        "majority": 0.5201816867967379,
+        "val_acc": 0.520697832107544,
+        "skipped": false,
+        "stage": "other-bash"
+      },
+      "submission": {
+        "n": 742,
+        "majority": 0.5296495956873315,
+        "val_acc": 0.5579515099525452,
+        "skipped": false,
+        "stage": "submission"
+      },
+      "testing": {
+        "n": 6037,
+        "majority": 0.5534205731323505,
+        "val_acc": 0.5202915072441101,
+        "skipped": false,
+        "stage": "testing"
+      }
+    }
+  }
+}

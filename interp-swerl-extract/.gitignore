@@ -1,0 +1,5 @@
+activations/
+figures_*/probes/
+*.log
+*.jsonl
+wandb/
