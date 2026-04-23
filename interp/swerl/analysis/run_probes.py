@@ -160,11 +160,14 @@ def _train_probe(
     labels: list[int],
     args: ProbeRunArgs,
     save_path: Path | None = None,
+    wb=None,
+    metric_prefix: str = "",
 ) -> dict:
     """Train a linear (logistic regression) probe and return accuracy metrics.
 
     Uses L2-regularised logistic regression via gradient descent on CPU.
     If save_path is given, saves the probe checkpoint there.
+    If wb and metric_prefix are given, logs per-epoch curves under that prefix.
     """
     n = len(acts)
     y_all = torch.tensor(labels, dtype=torch.long)
@@ -211,14 +214,18 @@ def _train_probe(
     criterion = nn.CrossEntropyLoss()
 
     best_val_acc = 0.0
-    for _ in range(args.lr_max_iter // 10):  # epoch count
+    for epoch in range(args.lr_max_iter // 10):
         probe.train()
+        total_loss = total_correct = total_n = 0
         for xb, yb in train_loader:
             logits = probe(xb)
             loss = criterion(logits, yb)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            total_loss += loss.item() * len(yb)
+            total_correct += (logits.argmax(-1) == yb).sum().item()
+            total_n += len(yb)
 
         probe.eval()
         correct = total = 0
@@ -230,6 +237,13 @@ def _train_probe(
         val_acc = correct / total if total > 0 else 0.0
         best_val_acc = max(best_val_acc, val_acc)
 
+        if wb is not None and metric_prefix:
+            wb.log({
+                f"{metric_prefix}/train_loss": total_loss / total_n if total_n > 0 else 0.0,
+                f"{metric_prefix}/train_acc": total_correct / total_n if total_n > 0 else 0.0,
+                f"{metric_prefix}/val_acc": val_acc,
+            })
+
     if save_path is not None:
         _save_probe(probe, mu, std, save_path)
 
@@ -237,35 +251,23 @@ def _train_probe(
 
 
 # ---------------------------------------------------------------------------
-# Single-probe experiment
+# Helpers
 # ---------------------------------------------------------------------------
 
 
-def _train_global_probe_all_axes(
+def _collect_records(
     records: list[TrajectoryRecord],
     layer: int,
-    n_bins: int,
-    args: ProbeRunArgs,
-    save_path: Path | None = None,
-) -> tuple[list[dict], list[dict], dict[str, dict]]:
-    """Train ONE probe on all activations, evaluate per axis.
+) -> tuple[list[torch.Tensor], list[int], list[float], list[float], list[str]]:
+    """Flatten per-token activations from all records into parallel lists.
 
-    Collects every captured activation across all records with per-activation
-    axis metadata (position fraction, turn fraction, stage).  Performs a single
-    global 80/20 train/val split, trains one linear probe, then slices the val
-    predictions by each axis to produce per-group accuracy.
-    If save_path is given, saves the probe checkpoint there.
-
-    Returns:
-        pos_results   — list[dict] indexed 0…n_bins-1  (token position bins)
-        tc_results    — list[dict] indexed 0…n_bins-1  (tool-call index buckets)
-        stage_results — dict[stage → dict]
+    Returns (acts, labels, pos_fracs, turn_fracs, stages).
     """
     all_acts: list[torch.Tensor] = []
     all_labels: list[int] = []
     all_pos_fracs: list[float] = []
     all_turn_fracs: list[float] = []
-    all_stages_list: list[str] = []
+    all_stages: list[str] = []
 
     for record in records:
         acts = record.activations.get(layer)
@@ -281,7 +283,40 @@ def _train_global_probe_all_axes(
             all_pos_fracs.append(pos / denom_pos)
             all_turn_fracs.append(turn_idx / denom_turn)
             stage = record.stages[turn_idx] if turn_idx < len(record.stages) else "unknown"
-            all_stages_list.append(stage)
+            all_stages.append(stage)
+
+    return all_acts, all_labels, all_pos_fracs, all_turn_fracs, all_stages
+
+
+# ---------------------------------------------------------------------------
+# Single-probe experiment
+# ---------------------------------------------------------------------------
+
+
+def _train_global_probe_all_axes(
+    records: list[TrajectoryRecord],
+    layer: int,
+    n_bins: int,
+    args: ProbeRunArgs,
+    save_path: Path | None = None,
+    wb=None,
+) -> tuple[list[dict], list[dict], dict[str, dict]]:
+    """Train ONE probe on all activations, evaluate per axis.
+
+    Collects every captured activation across all records with per-activation
+    axis metadata (position fraction, turn fraction, stage).  Performs a single
+    global 80/20 train/val split, trains one linear probe, then slices the val
+    predictions by each axis to produce per-group accuracy.
+    If save_path is given, saves the probe checkpoint there.
+
+    Returns:
+        pos_results   — list[dict] indexed 0…n_bins-1  (token position bins)
+        tc_results    — list[dict] indexed 0…n_bins-1  (tool-call index buckets)
+        stage_results — dict[stage → dict]
+    """
+    all_acts, all_labels, all_pos_fracs, all_turn_fracs, all_stages_list = _collect_records(
+        records, layer
+    )
 
     n = len(all_acts)
     nan_result = {"n": 0, "majority": float("nan"), "val_acc": float("nan"), "skipped": True}
@@ -328,13 +363,28 @@ def _train_global_probe_all_axes(
     optimizer = torch.optim.Adam(probe.parameters(), lr=1e-2, weight_decay=1.0 / args.lr_C)
     criterion = nn.CrossEntropyLoss()
     train_loader = DataLoader(TensorDataset(X_train, y_train), batch_size=512, shuffle=True)
-    for _ in range(args.lr_max_iter // 10):
+    for epoch in range(args.lr_max_iter // 10):
         probe.train()
+        total_loss = total_correct = total_n = 0
         for xb, yb in train_loader:
-            loss = criterion(probe(xb), yb)
+            logits = probe(xb)
+            loss = criterion(logits, yb)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
+            total_loss += loss.item() * len(yb)
+            total_correct += (logits.argmax(-1) == yb).sum().item()
+            total_n += len(yb)
+
+        if wb is not None:
+            probe.eval()
+            with torch.no_grad():
+                epoch_val_acc = (probe(X_val).argmax(-1) == y_val).float().mean().item()
+            wb.log({
+                "global_probe/train_loss": total_loss / total_n if total_n > 0 else 0.0,
+                "global_probe/train_acc": total_correct / total_n if total_n > 0 else 0.0,
+                "global_probe/val_acc": epoch_val_acc,
+            })
 
     probe.eval()
     with torch.no_grad():
@@ -657,6 +707,7 @@ def run_probes(args: ProbeRunArgs) -> None:
         gp_pos, gp_tc, gp_stage = _train_global_probe_all_axes(
             records, layer=args.layer, n_bins=args.n_bins, args=args,
             save_path=probes_dir / "global_probe.pt",
+            wb=wb,
         )
 
         for r in gp_pos:
