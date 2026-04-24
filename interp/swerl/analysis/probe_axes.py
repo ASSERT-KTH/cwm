@@ -38,6 +38,8 @@ class TrajectoryRecord:
     total_tokens: int
     # Final test-suite outcome: True = pass, False = fail
     outcome: bool
+    # SWEbench instance ID (filename stem), used for trajectory-level train/val split
+    instance_id: str = ""
 
 
 # Type alias for a single bucket's data

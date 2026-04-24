@@ -45,7 +45,7 @@ def main() -> None:
     args = load_from_cli(OverfitArgs)
 
     records = load_records(Path(args.extract_dir), layer=args.layer, max_captures_per_file=args.max_captures_per_file)
-    all_acts, all_labels, _, _, _ = _collect_records(records, args.layer)
+    all_acts, all_labels, _, _, _, _ = _collect_records(records, args.layer)
 
     # Pick n_per_class examples from each class
     pos_idx = [i for i, l in enumerate(all_labels) if l == 1]

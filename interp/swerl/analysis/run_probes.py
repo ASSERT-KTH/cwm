@@ -135,6 +135,7 @@ def load_records(
                 stages=stages,
                 total_tokens=data.get("total_tokens", 1),
                 outcome=bool(data.get("outcome", False)),
+                instance_id=path.stem,
             )
         )
 
@@ -258,16 +259,18 @@ def _train_probe(
 def _collect_records(
     records: list[TrajectoryRecord],
     layer: int,
-) -> tuple[list[torch.Tensor], list[int], list[float], list[float], list[str]]:
+) -> tuple[list[torch.Tensor], list[int], list[float], list[float], list[str], list[str]]:
     """Flatten per-token activations from all records into parallel lists.
 
-    Returns (acts, labels, pos_fracs, turn_fracs, stages).
+    Returns (acts, labels, pos_fracs, turn_fracs, stages, instance_ids).
+    instance_ids allows trajectory-level train/val splits.
     """
     all_acts: list[torch.Tensor] = []
     all_labels: list[int] = []
     all_pos_fracs: list[float] = []
     all_turn_fracs: list[float] = []
     all_stages: list[str] = []
+    all_instance_ids: list[str] = []
 
     for record in records:
         acts = record.activations.get(layer)
@@ -284,8 +287,9 @@ def _collect_records(
             all_turn_fracs.append(turn_idx / denom_turn)
             stage = record.stages[turn_idx] if turn_idx < len(record.stages) else "unknown"
             all_stages.append(stage)
+            all_instance_ids.append(record.instance_id)
 
-    return all_acts, all_labels, all_pos_fracs, all_turn_fracs, all_stages
+    return all_acts, all_labels, all_pos_fracs, all_turn_fracs, all_stages, all_instance_ids
 
 
 # ---------------------------------------------------------------------------
@@ -314,7 +318,7 @@ def _train_global_probe_all_axes(
         tc_results    — list[dict] indexed 0…n_bins-1  (tool-call index buckets)
         stage_results — dict[stage → dict]
     """
-    all_acts, all_labels, all_pos_fracs, all_turn_fracs, all_stages_list = _collect_records(
+    all_acts, all_labels, all_pos_fracs, all_turn_fracs, all_stages_list, _ = _collect_records(
         records, layer
     )
 
