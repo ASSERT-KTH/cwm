@@ -129,3 +129,57 @@ fig2.tight_layout()
 fig2.savefig(out2, dpi=150)
 plt.close(fig2)
 print(f'Saved: {out2}')
+
+# ===========================================================================
+# Figure 3: will_be_correct — definitive run (easy mutations, buggy-only,
+#           split_by=original 70/15/15, best sweep hyperparams)
+#           Solid = test (reported), dashed = val (for agreement check)
+# ===========================================================================
+
+d_def = torch.load(
+    os.path.join(BASE, 'interp-bug-trajectories-track_a/probe_temporal_will_be_correct.pt'),
+    map_location='cpu',
+)
+hm_def = d_def['heatmap']
+bins10 = list(range(10))
+MAJORITY_BASELINE = 0.605
+
+fig3, ax3 = plt.subplots(figsize=(10, 6))
+
+for layer in LAYERS:
+    color = COLORS[layer]
+    y_test = [hm_def[layer][b]['test_acc'] for b in bins10]
+    y_val  = [hm_def[layer][b]['val_acc']  for b in bins10]
+    ax3.plot(bins10, y_test, color=color, linestyle='-',  linewidth=2.0, label=f'{LAYER_NAMES[layer]} (test)')
+    ax3.plot(bins10, y_val,  color=color, linestyle='--', linewidth=1.2, alpha=0.6)
+
+ax3.axhline(MAJORITY_BASELINE, color='black', linestyle=':', linewidth=1.5, alpha=0.8,
+            label=f'Majority baseline ({MAJORITY_BASELINE:.1%})')
+
+ax3.set_xlim(0, 9)
+ax3.set_xticks(bins10)
+ax3.set_xticklabels([f'bin{b:02d}' for b in bins10], fontsize=9, rotation=30)
+ax3.set_ylim(0.55, 1.0)
+ax3.set_xlabel('Relative time bin (0 = start of generation, 9 = end)', fontsize=12)
+ax3.set_ylabel('Probe accuracy', fontsize=12)
+ax3.set_title(
+    'will_be_correct probe — definitive results\n'
+    'Easy mutations, buggy-only, split_by=original (70/15/15)\n'
+    'Solid = test (reported), dashed = val',
+    fontsize=12,
+)
+ax3.grid(True, alpha=0.3)
+
+legend_handles3 = [
+    mlines.Line2D([], [], color=COLORS[l], linestyle='-', linewidth=2.0, label=f'{LAYER_NAMES[l]} (test)')
+    for l in LAYERS
+]
+legend_handles3.append(mlines.Line2D([], [], color='gray', linestyle='--', linewidth=1.2, label='val (all layers, dashed)'))
+legend_handles3.append(mlines.Line2D([], [], color='black', linestyle=':', linewidth=1.5, label=f'Majority baseline ({MAJORITY_BASELINE:.1%})'))
+ax3.legend(handles=legend_handles3, loc='upper left', fontsize=10)
+
+out3 = os.path.join(FIG_DIR, 'probe_wbc_definitive.png')
+fig3.tight_layout()
+fig3.savefig(out3, dpi=150)
+plt.close(fig3)
+print(f'Saved: {out3}')
