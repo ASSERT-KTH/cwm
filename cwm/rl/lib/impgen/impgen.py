@@ -88,6 +88,7 @@ class ImpGen(ImpGenAPI):
         self._generator = g.generate(self._q)
         self._in_flight: int = 0
         self._futures: dict[int, Future[Packet]] = {}
+        self._none_sent: bool = False
 
     def update_model(self) -> None:
         """
@@ -151,8 +152,9 @@ class ImpGen(ImpGenAPI):
         if not self.done:
             self._stop_queue.put_object(self.tp_rank)
             self.done = True
-        if self._stop_queue.qsize() == self.tp_size and self.tp_rank == 0:
+        if not self._none_sent and self._stop_queue.qsize() == self.tp_size and self.tp_rank == 0:
             self._tp_queue.put_object(None)
+            self._none_sent = True
 
     def work(self) -> bool:
         """

@@ -64,3 +64,7 @@ docs/_sources
 # Ultimate logs
 Ultimate.log
 UltimateCounterExample.errorpath
+
+model_weights/
+logs/
+*.log
