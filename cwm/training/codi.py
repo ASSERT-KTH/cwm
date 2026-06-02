@@ -92,39 +92,6 @@ def default_codi_config_from_tokenizer(
     )
 
 
-def load_codi_teacher_student(
-    model_name_or_path: str = "facebook/cwm",
-    *,
-    latent_steps: int,
-    dtype: torch.dtype = torch.bfloat16,
-    device_map: str | dict | None = "auto",
-    token: str | bool | None = True,
-    use_thought_projector: bool = False,
-) -> tuple[object, "CodiModel"]:
-    from transformers import AutoModelForCausalLM, AutoTokenizer
-
-    tokenizer = AutoTokenizer.from_pretrained(model_name_or_path, token=token)
-    config = default_codi_config_from_tokenizer(tokenizer, latent_steps=latent_steps)
-    teacher = AutoModelForCausalLM.from_pretrained(
-        model_name_or_path,
-        dtype=dtype,
-        device_map=device_map,
-        token=token,
-    )
-    student = AutoModelForCausalLM.from_pretrained(
-        model_name_or_path,
-        dtype=dtype,
-        device_map=device_map,
-        token=token,
-    )
-    return tokenizer, CodiModel(
-        teacher=teacher,
-        student=student,
-        config=config,
-        use_thought_projector=use_thought_projector,
-    )
-
-
 def apply_lora(student: nn.Module, config: CodiConfig) -> nn.Module:
     if hasattr(student, "peft_config"):
         return student
@@ -146,17 +113,13 @@ class CodiModel(nn.Module):
     def __init__(
         self,
         *,
-        teacher: nn.Module,
         student: nn.Module,
         config: CodiConfig,
         use_thought_projector: bool = False,
     ) -> None:
         super().__init__()
-        self.teacher = teacher
         self.student = apply_lora(student, config)
         self.config = config
-        self.teacher.requires_grad_(False)
-        self.teacher.eval()
 
         self.thought_projector = None
         if use_thought_projector:
@@ -216,7 +179,6 @@ class CodiModel(nn.Module):
                     inputs_embeds=embed.view(1, 1, -1),
                     past_key_values=past,
                     output_hidden_states=True,
-                    use_cache=True,
                 )
                 past = output.past_key_values
                 logits_steps.append(output.logits[0, -1])
@@ -354,14 +316,11 @@ class CodiModel(nn.Module):
 
     def _hidden_loss(
         self,
-        student_hidden: torch.Tensor,
-        teacher_hidden: torch.Tensor,
-        batch_idx: torch.Tensor,
-        teacher_pos: torch.Tensor,
-        student_pos: torch.Tensor,
+        student_vec: torch.Tensor,
+        teacher_vec: torch.Tensor,
     ) -> torch.Tensor:
-        student_vec = student_hidden[batch_idx, student_pos].float()
-        teacher_vec = teacher_hidden[batch_idx, teacher_pos].detach().float()
+        student_vec = student_vec.float()
+        teacher_vec = teacher_vec.float()
 
         if self.config.normalize_kd_by_teacher_std:
             scale = teacher_vec.std(dim=0, unbiased=False).clamp_min(self.config.kd_eps)
@@ -378,22 +337,16 @@ class CodiModel(nn.Module):
 
     def _kd_loss(
         self,
-        student_output,
-        teacher_output,
-        batch_idx: torch.Tensor,
-        teacher_pos: torch.Tensor,
-        student_pos: torch.Tensor,
+        student_kd_vecs: list[torch.Tensor] | None,
+        teacher_kd_vecs: list[torch.Tensor] | None,
+        zero_ref: torch.Tensor,
     ) -> torch.Tensor:
-        if batch_idx.numel() == 0:
-            return student_output.logits.sum() * 0.0
+        if student_kd_vecs is None:
+            return zero_ref.sum() * 0.0
 
         losses = [
-            self._hidden_loss(s_h, t_h, batch_idx, teacher_pos, student_pos)
-            for s_h, t_h in zip(
-                student_output.hidden_states[1:],
-                teacher_output.hidden_states[1:],
-                strict=True,
-            )
+            self._hidden_loss(s_v, t_v)
+            for s_v, t_v in zip(student_kd_vecs, teacher_kd_vecs, strict=True)
         ]
         return torch.stack(losses).mean()
 
@@ -424,20 +377,47 @@ class CodiModel(nn.Module):
         )
         lm_loss = self._lm_loss(student_output.logits, student_labels)
 
+        # Slice student hidden states at KD positions and immediately free the
+        # full [B, max_student_len, H] tensors to reclaim VRAM before the
+        # teacher forward.
+        if batch_idx.numel() > 0:
+            student_kd_vecs: list[torch.Tensor] | None = [
+                h[batch_idx, student_pos] for h in student_output.hidden_states[1:]
+            ]
+        else:
+            student_kd_vecs = None
+        del student_output.hidden_states
+
         with torch.no_grad():
-            teacher_output = self.teacher(
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                output_hidden_states=True,
-                use_cache=False,
-            )
-        kd_loss = self._kd_loss(
-            student_output,
-            teacher_output,
-            batch_idx,
-            teacher_pos,
-            student_pos,
-        )
+            disable_adapter = getattr(self.student, "disable_adapter", None)
+            if disable_adapter is None:
+                raise RuntimeError(
+                    "CodiModel needs a PEFT student with disable_adapter()."
+                )
+            was_training = self.student.training
+            self.student.eval()
+            try:
+                with disable_adapter():
+                    teacher_output = self.student(
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        output_hidden_states=True,
+                        use_cache=False,
+                    )
+            finally:
+                self.student.train(was_training)
+
+            # Slice at KD positions and free the full [B, L, H] teacher tensors.
+            if batch_idx.numel() > 0:
+                teacher_kd_vecs: list[torch.Tensor] | None = [
+                    h[batch_idx, teacher_pos].detach()
+                    for h in teacher_output.hidden_states[1:]
+                ]
+            else:
+                teacher_kd_vecs = None
+            del teacher_output
+
+        kd_loss = self._kd_loss(student_kd_vecs, teacher_kd_vecs, student_output.logits)
         loss = self.config.lm_loss_weight * lm_loss + self.config.kd_loss_weight * kd_loss
         kd_positions = torch.stack((batch_idx, teacher_pos, student_pos), dim=1)
         metrics = {

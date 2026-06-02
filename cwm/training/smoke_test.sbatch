@@ -1,27 +1,23 @@
 #!/bin/bash
-#SBATCH -J cwm-codi-train
-#SBATCH -t 24:00:00
+#SBATCH -J cwm-smoke
+#SBATCH -t 00:30:00
 #SBATCH -N 1
 #SBATCH --gpus=8
-#SBATCH -C "thin"
-#SBATCH -o logs/codi_train_%j.out
-#SBATCH -e logs/codi_train_%j.err
+#SBATCH -o logs/smoke_%j.out
+#SBATCH -e logs/smoke_%j.err
 
-# Teacher-forcing CODI distillation on CRUXEval-O traces.
-# 4 GPUs/model-shard x 2 data-parallel replicas.
-OUT=/proj/assert-berzelius/users/x_sirli/distill_adapter/codi_$(date +%m%d%H%M)
+OUT=/proj/assert-berzelius/users/x_sirli/distill_adapter/smoke_$(date +%m%d%H%M)
 
 module load Miniforge3/24.7.1-2-hpc1-bdist
 mamba activate CWM
 
 cd /home/x_sirli/distill_cwm/cwm_andre
 
-# Compute nodes are offline: local weights, pre-cached dataset, wandb logs to $OUT/wandb.
 export HF_HUB_OFFLINE=1 HF_DATASETS_OFFLINE=1
-export WANDB_MODE=offline WANDB_DIR=${OUT}
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+export WANDB_MODE=offline
 mkdir -p ${OUT} logs
 
+# n_samples=16 -> 8 samples/rank; grad_accum_steps=8 keeps global batch 16.
 export MASTER_ADDR=127.0.0.1
 export MASTER_PORT=$((20000 + SLURM_JOB_ID % 40000))
 GPU_PAIRS=("0,1,2,3" "4,5,6,7")
@@ -38,10 +34,10 @@ launch_rank() {
     python -m cwm.training.train \
         model_name_or_path=model_weights/cwm_hf \
         output_dir=${OUT} \
-        latent_steps=2 n_samples=-1 max_seq_len=2048 epochs=1 \
-        batch_size=1 grad_accum_steps=32 \
+        latent_steps=3 n_samples=16 max_seq_len=512 \
+        batch_size=1 grad_accum_steps=8 epochs=1 \
         device_map=auto flash_attn=true \
-        wandb_log=true &
+        wandb_log=false &
     pids+=("$!")
 }
 

@@ -27,9 +27,7 @@ def _tiny_model() -> CwmForCausalLM:
 
 def test_codi_loss_backprops_only_to_student() -> None:
     torch.manual_seed(0)
-    teacher = _tiny_model()
     student = _tiny_model()
-    student.load_state_dict(teacher.state_dict())
 
     config = CodiConfig(
         line_sep_token_id=10,
@@ -39,7 +37,7 @@ def test_codi_loss_backprops_only_to_student() -> None:
         latent_steps=2,
         expected_action_next_token_id=9,
     )
-    model = CodiModel(teacher=teacher, student=student, config=config)
+    model = CodiModel(student=student, config=config)
 
     input_ids = torch.tensor(
         [
@@ -58,8 +56,6 @@ def test_codi_loss_backprops_only_to_student() -> None:
 
     output.loss.backward()
 
-    assert all(p.grad is None for p in teacher.parameters())
-
     trainable = [(name, p) for name, p in model.student.named_parameters() if p.requires_grad]
     frozen = [(name, p) for name, p in model.student.named_parameters() if not p.requires_grad]
     assert trainable
@@ -71,9 +67,7 @@ def test_codi_loss_backprops_only_to_student() -> None:
 
 def test_codi_kd_positions_ignore_masked_prompt_tokens() -> None:
     torch.manual_seed(0)
-    teacher = _tiny_model()
     student = _tiny_model()
-    student.load_state_dict(teacher.state_dict())
 
     config = CodiConfig(
         line_sep_token_id=10,
@@ -83,7 +77,7 @@ def test_codi_kd_positions_ignore_masked_prompt_tokens() -> None:
         latent_steps=1,
         expected_action_next_token_id=9,
     )
-    model = CodiModel(teacher=teacher, student=student, config=config)
+    model = CodiModel(student=student, config=config)
 
     input_ids = torch.tensor([[2, 13, 9, 10, 7, 13, 9, 3]])
     attention_mask = torch.ones_like(input_ids)
