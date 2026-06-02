@@ -14,11 +14,18 @@ teacher-forced (ground-truth embeddings fed at every step).
 from __future__ import annotations
 
 import logging
+import os
+from contextlib import nullcontext
 from dataclasses import dataclass
 from pathlib import Path
 
 import torch
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+import wandb
+
 
 from cwm.training.codi import CodiModel, default_codi_config_from_tokenizer
 from cwm.training.data import IGNORE_INDEX, build_dataset
@@ -37,10 +44,13 @@ class TrainArgs:
     batch_size: int = 1
     grad_accum_steps: int = 8
     max_grad_norm: float = 1.0
+    save_every_steps: int = 0  # 0 = save only at end
     n_samples: int = -1
     max_seq_len: int = 8192
     seed: int = 42
     wandb_log: bool = False
+    wandb_name: str = ""
+    wandb_log_every: int = 10  # optimizer steps per wandb log point
     device_map: str = "auto"
 
 
@@ -62,94 +72,219 @@ def _collate(batch, pad_id: int) -> dict[str, torch.Tensor]:
 def main(args: TrainArgs) -> None:
     from transformers import AutoModelForCausalLM, AutoTokenizer
 
-    torch.manual_seed(args.seed)
-    tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
+    dist_state = _init_distributed()
+    try:
+        torch.manual_seed(args.seed + dist_state.rank)
+        tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
 
-    # Trace format: the token after <|action_sep|> is source (not <|eot_id|>),
-    # so KD positions must not require an eot next token.
-    config = default_codi_config_from_tokenizer(
-        tokenizer, latent_steps=args.latent_steps, require_action_next_eot=False
-    )
-    config.wandb_log = args.wandb_log
-
-    load = lambda: AutoModelForCausalLM.from_pretrained(
-        args.model_name_or_path, dtype=torch.bfloat16, device_map=args.device_map
-    )
-    model = CodiModel(
-        teacher=load(),
-        student=load(),
-        config=config,
-        use_thought_projector=args.use_thought_projector,
-    )
-    model.train()
-
-    pad_id = tokenizer.pad_token_id if tokenizer.pad_token_id is not None else tokenizer.eos_token_id
-    device = model.input_embeddings.weight.device
-
-    dataset = build_dataset(tokenizer, n_samples=args.n_samples, max_seq_len=args.max_seq_len)
-    loader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=True, collate_fn=lambda b: _collate(b, pad_id)
-    )
-    if args.grad_accum_steps <= 0:
-        raise ValueError("grad_accum_steps must be positive")
-
-    params = [p for p in model.parameters() if p.requires_grad]
-    logger.info("%d examples, %d trainable params", len(dataset), sum(p.numel() for p in params))
-    optimizer = torch.optim.AdamW(params, lr=args.lr)
-
-    if args.wandb_log:
-        import wandb
-
-        wandb.init(project="codi-cruxeval", config=vars(args))
-
-    step = 0
-
-    def optimizer_step(epoch: int, out, accum_batches: int) -> None:
-        nonlocal step
-        if accum_batches < args.grad_accum_steps:
-            scale = args.grad_accum_steps / accum_batches
-            for param in params:
-                if param.grad is not None:
-                    param.grad.mul_(scale)
-        torch.nn.utils.clip_grad_norm_(params, args.max_grad_norm)
-        optimizer.step()
-        optimizer.zero_grad()
-        step += 1
-        logger.info(
-            "epoch %d step %d loss=%.4f lm=%.4f kd=%.4f kd_pos=%d",
-            epoch, step, out.loss.item(), out.lm_loss.item(), out.kd_loss.item(),
-            int(out.metrics["num_kd_positions"].item()),
+        # Trace format: the token after <|action_sep|> is source (not <|eot_id|>),
+        # so KD positions must not require an eot next token.
+        config = default_codi_config_from_tokenizer(
+            tokenizer, latent_steps=args.latent_steps, require_action_next_eot=False
         )
 
-    optimizer.zero_grad()
-    accum_batches = 0
-    last_out = None
-    for epoch in range(args.epochs):
-        for batch in loader:
-            batch = {k: v.to(device) for k, v in batch.items()}
-            out = model(batch["input_ids"], labels=batch["labels"],
-                        attention_mask=batch["attention_mask"], wandb_step=step)
-            (out.loss / args.grad_accum_steps).backward()
-            accum_batches += 1
-            last_out = out
+        load_device_map = args.device_map
+        if dist_state.enabled:
+            if args.device_map not in (None, "none", "None"):
+                logger.warning(
+                    "DDP replicates the model per rank; ignoring device_map=%r",
+                    args.device_map,
+                )
+            load_device_map = None
 
-            if accum_batches == args.grad_accum_steps:
-                optimizer_step(epoch, out, accum_batches)
-                accum_batches = 0
-                last_out = None
+        def load():
+            kwargs = {"dtype": torch.bfloat16}
+            if load_device_map not in (None, "none", "None"):
+                kwargs["device_map"] = load_device_map
+            return AutoModelForCausalLM.from_pretrained(
+                args.model_name_or_path, **kwargs
+            )
 
-        if accum_batches:
-            assert last_out is not None
-            optimizer_step(epoch, last_out, accum_batches)
+        model = CodiModel(
+            teacher=load(),
+            student=load(),
+            config=config,
+            use_thought_projector=args.use_thought_projector,
+        )
+        if load_device_map in (None, "none", "None"):
+            model.to(dist_state.device)
+        model.train()
+
+        train_model = model
+        if dist_state.enabled:
+            train_model = DistributedDataParallel(
+                model,
+                device_ids=[dist_state.local_rank] if dist_state.device.type == "cuda" else None,
+                find_unused_parameters=True,
+            )
+
+        pad_id = (
+            tokenizer.pad_token_id
+            if tokenizer.pad_token_id is not None
+            else tokenizer.eos_token_id
+        )
+        device = model.input_embeddings.weight.device
+
+        dataset = build_dataset(
+            tokenizer, n_samples=args.n_samples, max_seq_len=args.max_seq_len
+        )
+        sampler = (
+            DistributedSampler(
+                dataset,
+                num_replicas=dist_state.world_size,
+                rank=dist_state.rank,
+                shuffle=True,
+                seed=args.seed,
+            )
+            if dist_state.enabled
+            else None
+        )
+        loader = DataLoader(
+            dataset,
+            batch_size=args.batch_size,
+            shuffle=sampler is None,
+            sampler=sampler,
+            collate_fn=lambda b: _collate(b, pad_id),
+        )
+        if args.grad_accum_steps <= 0:
+            raise ValueError("grad_accum_steps must be positive")
+
+        params = [p for p in model.parameters() if p.requires_grad]
+        logger.info(
+            "rank %d/%d: %d examples, %d local batches, %d trainable params",
+            dist_state.rank,
+            dist_state.world_size,
+            len(dataset),
+            len(loader),
+            sum(p.numel() for p in params),
+        )
+        optimizer = torch.optim.AdamW(params, lr=args.lr)
+
+        use_wandb = args.wandb_log and dist_state.is_rank_zero
+        if use_wandb:
+            import wandb
+
+            wandb.init(project="codi_distill_cwm", config=vars(args))
+
+        out_dir = Path(args.output_dir)
+
+        def save_checkpoint(path: Path) -> None:
+            if not dist_state.is_rank_zero:
+                return
+            path.mkdir(parents=True, exist_ok=True)
+            model.student.save_pretrained(path)  # LoRA adapter only
+            if model.thought_projector is not None:
+                torch.save(
+                    model.thought_projector.state_dict(),
+                    path / "thought_projector.pt",
+                )
+            logger.info("Saved checkpoint to %s", path)
+
+        step = 0
+
+        def optimizer_step(epoch: int, window: dict, accum_batches: int) -> None:
+            nonlocal step
+            # Partial final window: rescale grads so the average matches a full window.
+            if accum_batches < args.grad_accum_steps:
+                scale = args.grad_accum_steps / accum_batches
+                for param in params:
+                    if param.grad is not None:
+                        param.grad.mul_(scale)
+            grad_norm = torch.nn.utils.clip_grad_norm_(params, args.max_grad_norm)
+            optimizer.step()
+            optimizer.zero_grad()
+            step += 1
+
+            metrics = torch.tensor(
+                [
+                    window["loss"],
+                    window["lm"],
+                    window["kd"],
+                    window["kd_pos"],
+                    float(accum_batches),
+                ],
+                device=device,
+                dtype=torch.float32,
+            )
+            if dist_state.enabled:
+                dist.all_reduce(metrics, op=dist.ReduceOp.SUM)
+            total_batches = float(metrics[4].item())
+            loss = float(metrics[0].item()) / total_batches
+            lm = float(metrics[1].item()) / total_batches
+            kd = float(metrics[2].item()) / total_batches
+            kd_pos = float(metrics[3].item()) / total_batches
+            lr = optimizer.param_groups[0]["lr"]
+
+            if dist_state.is_rank_zero:
+                logger.info(
+                    "epoch %d step %d loss=%.4f lm=%.4f kd=%.4f "
+                    "kd_pos=%.1f grad_norm=%.3f",
+                    epoch,
+                    step,
+                    loss,
+                    lm,
+                    kd,
+                    kd_pos,
+                    float(grad_norm),
+                )
+                if use_wandb:
+                    wandb.log(
+                        {
+                            "loss": loss,
+                            "lm_loss": lm,
+                            "kd_loss": kd,
+                            "num_kd_positions": kd_pos,
+                            "grad_norm": float(grad_norm),
+                            "lr": lr,
+                            "epoch": epoch,
+                        },
+                        step=step,
+                    )
+            if args.save_every_steps and step % args.save_every_steps == 0:
+                save_checkpoint(out_dir / f"checkpoint-{step}")
+
+        def new_window() -> dict:
+            return {"loss": 0.0, "lm": 0.0, "kd": 0.0, "kd_pos": 0.0}
+
+        optimizer.zero_grad()
+        for epoch in range(args.epochs):
+            if sampler is not None:
+                sampler.set_epoch(epoch)
             accum_batches = 0
-            last_out = None
+            window = new_window()
+            num_batches = len(loader)
+            for batch_idx, batch in enumerate(loader):
+                batch = {k: v.to(device) for k, v in batch.items()}
+                will_step = (
+                    accum_batches + 1 == args.grad_accum_steps
+                    or batch_idx + 1 == num_batches
+                )
+                sync_context = nullcontext()
+                if dist_state.enabled and not will_step:
+                    sync_context = train_model.no_sync()
 
-    out_dir = Path(args.output_dir)
-    out_dir.mkdir(parents=True, exist_ok=True)
-    model.student.save_pretrained(out_dir)  # LoRA adapter only
-    if model.thought_projector is not None:
-        torch.save(model.thought_projector.state_dict(), out_dir / "thought_projector.pt")
-    logger.info("Saved to %s", out_dir)
+                with sync_context:
+                    out = train_model(
+                        batch["input_ids"],
+                        labels=batch["labels"],
+                        attention_mask=batch["attention_mask"],
+                    )
+                    (out.loss / args.grad_accum_steps).backward()
+
+                accum_batches += 1
+                window["loss"] += out.loss.item()
+                window["lm"] += out.lm_loss.item()
+                window["kd"] += out.kd_loss.item()
+                window["kd_pos"] += out.metrics["num_kd_positions"].item()
+
+                if will_step:
+                    optimizer_step(epoch, window, accum_batches)
+                    accum_batches = 0
+                    window = new_window()
+
+        save_checkpoint(out_dir)
+    finally:
+        _destroy_distributed(dist_state)
 
 
 if __name__ == "__main__":

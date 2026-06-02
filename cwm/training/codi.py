@@ -36,10 +36,6 @@ class CodiConfig:
         "up_proj",
         "down_proj",
     )
-    wandb_log: bool = False
-    wandb_log_prefix: str = "codi"
-    wandb_log_every_n_steps: int = 1
-    wandb_rank_zero_only: bool = True
 
     def __post_init__(self) -> None:
         if self.latent_steps < 0:
@@ -52,8 +48,6 @@ class CodiConfig:
             raise ValueError("lora_alpha must be positive")
         if self.lora_dropout < 0:
             raise ValueError("lora_dropout must be non-negative")
-        if self.wandb_log_every_n_steps <= 0:
-            raise ValueError("wandb_log_every_n_steps must be positive")
 
 
 @dataclass
@@ -176,7 +170,6 @@ class CodiModel(nn.Module):
             # Match student embedding device/dtype (sharded bf16 loading).
             ref = self.input_embeddings.weight
             self.thought_projector.to(device=ref.device, dtype=ref.dtype)
-        self._wandb_step = 0
 
     @property
     def input_embeddings(self) -> nn.Module:
@@ -404,59 +397,12 @@ class CodiModel(nn.Module):
         ]
         return torch.stack(losses).mean()
 
-    def _should_log_wandb(self, step: int) -> bool:
-        if not self.config.wandb_log or not self.training:
-            return False
-        if step % self.config.wandb_log_every_n_steps != 0:
-            return False
-        if (
-            self.config.wandb_rank_zero_only
-            and torch.distributed.is_available()
-            and torch.distributed.is_initialized()
-        ):
-            return torch.distributed.get_rank() == 0
-        return True
-
-    def _maybe_log_wandb(
-        self,
-        metrics: dict[str, torch.Tensor],
-        wandb_step: int | None,
-    ) -> None:
-        if not self.config.wandb_log:
-            return
-
-        step = self._wandb_step if wandb_step is None else wandb_step
-        if wandb_step is None:
-            self._wandb_step += 1
-        if not self._should_log_wandb(step):
-            return
-
-        try:
-            import wandb
-        except ImportError as exc:
-            raise RuntimeError("wandb_log=True requires wandb to be installed") from exc
-
-        if wandb.run is None:
-            return
-
-        prefix = self.config.wandb_log_prefix.strip("/")
-        metric_prefix = f"{prefix}/" if prefix else ""
-        wandb.log(
-            {
-                f"{metric_prefix}{name}": value.detach().float().item()
-                for name, value in metrics.items()
-                if value.numel() == 1
-            },
-            step=step,
-        )
-
     def forward(
         self,
         input_ids: torch.Tensor,
         *,
         labels: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
-        wandb_step: int | None = None,
     ) -> CodiOutput:
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
@@ -503,7 +449,6 @@ class CodiModel(nn.Module):
                 device=input_ids.device,
             ),
         }
-        self._maybe_log_wandb(metrics, wandb_step)
 
         return CodiOutput(
             loss=loss,
