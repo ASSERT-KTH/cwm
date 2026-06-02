@@ -1,7 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 from dataclasses import dataclass
-from types import SimpleNamespace
+import time
 from typing import Literal
 
 import torch
@@ -55,10 +55,6 @@ class CodiOutput:
     loss: torch.Tensor
     lm_loss: torch.Tensor
     kd_loss: torch.Tensor
-    logits: torch.Tensor
-    labels: torch.Tensor
-    attention_mask: torch.Tensor
-    orig_to_student_pos: torch.Tensor
     kd_positions: torch.Tensor
     metrics: dict[str, torch.Tensor]
 
@@ -147,144 +143,184 @@ class CodiModel(nn.Module):
         input_ids: torch.Tensor,
         labels: torch.Tensor,
         attention_mask: torch.Tensor,
-    ) -> tuple[object, torch.Tensor, torch.Tensor, torch.Tensor]:
-        '''
-        return:
-            - `student_output`: output of the student model with TEACHER FORCING and LATENT REASONING.
-                - TEACHER FORCING: If at i-th position, the student's output is different from ground truth, we will feed the ground truth token embedding at (i+1)-th step instead of the student's output.
-                - LATENT REASONING: after each <line_sep_token_id>, we will fix the following tokens as "<reasoning_thinking_start> <latent_embedding for a fixed number> <reasoning_thinking_end>". The original tokens will be replaced.
-            - `student_labels`: the labels for the student model, which is the same as `labels` except that the positions for latent reasoning are set to `ignore_index`.
-            - `student_attention_mask`: the attention mask for the student model, which is 1 for valid tokens and 0 for padding tokens.
-            - `orig_to_student_pos`: since the replacement of latent reasoning will change the sequence length, `orig_to_student_pos` is used to map the original input token indexes to the `student_labels` token indexes. 
-        '''
+        batch_idx: torch.Tensor,
+        teacher_pos: torch.Tensor,
+    ) -> tuple[torch.Tensor, list[torch.Tensor] | None, torch.Tensor, int, int]:
         cfg = self.config
         device = input_ids.device
         batch_size = input_ids.shape[0]
-        orig_to_student = torch.full_like(input_ids, -1)
+        lm_loss_sum = self.input_embeddings.weight.sum() * 0.0
+        lm_loss_count = torch.zeros((), device=device, dtype=torch.long)
+        student_pos: list[int] = []
+        student_kd_vecs: list[list[torch.Tensor]] | None = None
+        student_model_calls = 0
+        student_tokens = 0
+        targets_by_batch = [
+            teacher_pos[batch_idx == b].tolist() for b in range(batch_size)
+        ]
 
-        per_logits: list[torch.Tensor] = []
-        per_hidden: list[list[torch.Tensor]] = []
-        per_labels: list[torch.Tensor] = []
+        # Loop-invariants built once instead of per code line.
+        ignore = labels.new_tensor(cfg.ignore_index)
+        sot_embed = self._token_embed(cfg.sot_token_id, device)
+        eot_embed = self._token_embed(cfg.eot_token_id, device)
+        proj_device = proj_dtype = None
+        if self.thought_projector is not None:
+            proj_param = next(self.thought_projector.parameters())
+            proj_device, proj_dtype = proj_param.device, proj_param.dtype
+
+        # CPU copies so per-line chunk splitting needs no GPU->CPU sync.
+        valid_lens = attention_mask.sum(dim=1).tolist()
+        rows_cpu = input_ids.tolist()
+
+        def add_lm_loss(logits: torch.Tensor, next_labels: torch.Tensor) -> None:
+            nonlocal lm_loss_sum, lm_loss_count
+            if logits.shape[0] == 0:
+                return
+            lm_loss_sum = lm_loss_sum + F.cross_entropy(
+                logits,
+                next_labels,
+                ignore_index=cfg.ignore_index,
+                reduction="sum",
+            )
+            lm_loss_count += (next_labels != cfg.ignore_index).sum()
+
+        def collect_student_kd(
+            hidden_states: tuple[torch.Tensor, ...],
+            offsets: list[int],
+            start_pos: int,
+        ) -> None:
+            nonlocal student_kd_vecs
+            if not offsets:
+                return
+            if student_kd_vecs is None:
+                student_kd_vecs = [[] for _ in hidden_states[1:]]
+            offset_tensor = torch.tensor(offsets, device=device)
+            for layer_kd, hidden in zip(
+                student_kd_vecs, hidden_states[1:], strict=True
+            ):
+                layer_kd.extend(hidden[0, offset_tensor])
+            student_pos.extend(start_pos + offset for offset in offsets)
 
         for b in range(batch_size):
-            valid_len = int(attention_mask[b].sum().item())
+            valid_len = valid_lens[b]
+            row_ids = rows_cpu[b][:valid_len]
             past = None
-            logits_steps: list[torch.Tensor] = []
-            hidden_steps: list[list[torch.Tensor]] | None = None
-            out_labels: list[torch.Tensor] = []
+            prev_logits: torch.Tensor | None = None
+            student_len = 0
+            targets = targets_by_batch[b]
+            target_idx = 0
 
-            def step(embed: torch.Tensor) -> torch.Tensor:
-                nonlocal past, hidden_steps
+            def step(
+                embed: torch.Tensor,
+                label: torch.Tensor,
+                *,
+                output_hidden_states: bool = True,
+            ) -> torch.Tensor | None:
+                nonlocal past, prev_logits, student_len, student_model_calls, student_tokens
+                student_model_calls += 1
+                student_tokens += 1
                 output = self.student(
                     inputs_embeds=embed.view(1, 1, -1),
                     past_key_values=past,
-                    output_hidden_states=True,
-                )
-                past = output.past_key_values
-                logits_steps.append(output.logits[0, -1])
-                if hidden_steps is None:
-                    hidden_steps = [[] for _ in output.hidden_states]
-                for layer_idx, hidden in enumerate(output.hidden_states):
-                    hidden_steps[layer_idx].append(hidden[0, -1])
-                return output.hidden_states[-1][0, -1]
-
-            def step_chunk(embeds: torch.Tensor) -> torch.Tensor:
-                nonlocal past, hidden_steps
-                output = self.student(
-                    inputs_embeds=embeds.unsqueeze(0),
-                    past_key_values=past,
-                    output_hidden_states=True,
+                    output_hidden_states=output_hidden_states,
                     use_cache=True,
                 )
                 past = output.past_key_values
-                logits_steps.extend(output.logits[0])
-                if hidden_steps is None:
-                    hidden_steps = [[] for _ in output.hidden_states]
-                for layer_idx, hidden in enumerate(output.hidden_states):
-                    hidden_steps[layer_idx].extend(hidden[0])
-                return output.hidden_states[-1][0, -1]
+                if prev_logits is not None:
+                    add_lm_loss(prev_logits.view(1, -1), label.view(1))
+                prev_logits = output.logits[0, -1]
+                student_len += 1
+                if output_hidden_states:
+                    return output.hidden_states[-1][0, -1]
+                return None
 
-            orig_pos = 0
-            while orig_pos < valid_len:
-                remaining = input_ids[b, orig_pos:valid_len]
-                sep_positions = (remaining == cfg.line_sep_token_id).nonzero()
-                if sep_positions.numel() == 0:
-                    chunk_len = valid_len - orig_pos
-                    has_line_sep = False
-                else:
-                    chunk_len = int(sep_positions[0].item()) + 1
-                    has_line_sep = True
-
-                start_pos = len(logits_steps)
-                end_pos = orig_pos + chunk_len
-                orig_to_student[b, orig_pos:end_pos] = torch.arange(
-                    start_pos,
-                    start_pos + chunk_len,
-                    device=device,
-                    dtype=orig_to_student.dtype,
+            def step_chunk(
+                embeds: torch.Tensor,
+                chunk_labels: torch.Tensor,
+                *,
+                output_hidden_states: bool,
+            ):
+                nonlocal past, prev_logits, student_len, student_model_calls, student_tokens
+                student_model_calls += 1
+                student_tokens += embeds.shape[0]
+                output = self.student(
+                    inputs_embeds=embeds.unsqueeze(0),
+                    past_key_values=past,
+                    output_hidden_states=output_hidden_states,
+                    use_cache=True,
                 )
+                past = output.past_key_values
+                if prev_logits is not None:
+                    add_lm_loss(prev_logits.view(1, -1), chunk_labels[:1])
+                add_lm_loss(output.logits[0, :-1], chunk_labels[1:])
+                prev_logits = output.logits[0, -1]
+                student_len += embeds.shape[0]
+                return output
 
-                # Optimization: run contiguous teacher-forced tokens as one
-                # cached forward instead of launching one model call per token.
+            # Chunks end right after each line_sep (pure Python, no GPU sync).
+            boundaries: list[tuple[int, int, bool]] = []
+            prev = 0
+            for i in range(valid_len):
+                if row_ids[i] == cfg.line_sep_token_id:
+                    boundaries.append((prev, i + 1, True))
+                    prev = i + 1
+            if prev < valid_len:
+                boundaries.append((prev, valid_len, False))
+
+            for orig_pos, end_pos, has_line_sep in boundaries:
+                offsets = []
+                while target_idx < len(targets) and targets[target_idx] < end_pos:
+                    if targets[target_idx] >= orig_pos:
+                        offsets.append(targets[target_idx] - orig_pos)
+                    target_idx += 1
+
+                start_pos = student_len
                 chunk_ids = input_ids[b, orig_pos:end_pos]
-                step_chunk(self.input_embeddings(chunk_ids))
-                out_labels.extend(labels[b, orig_pos:end_pos])
-                orig_pos = end_pos
+                output = step_chunk(
+                    self.input_embeddings(chunk_ids),
+                    labels[b, orig_pos:end_pos],
+                    output_hidden_states=bool(offsets),
+                )
+                if offsets:
+                    collect_student_kd(output.hidden_states, offsets, start_pos)
 
                 if not has_line_sep:
                     continue
 
-                base = step(self._token_embed(cfg.sot_token_id, device))
-                out_labels.append(labels.new_tensor(cfg.ignore_index))
+                base = step(sot_embed, ignore)
                 for _ in range(cfg.latent_steps):
                     latent = base
                     if self.thought_projector is not None:
-                        p = next(self.thought_projector.parameters())
-                        latent = self.thought_projector(latent.to(device=p.device, dtype=p.dtype))
-                    base = step(latent)
-                    out_labels.append(labels.new_tensor(cfg.ignore_index))
-                step(self._token_embed(cfg.eot_token_id, device))
-                out_labels.append(labels.new_tensor(cfg.ignore_index))
+                        latent = self.thought_projector(
+                            latent.to(device=proj_device, dtype=proj_dtype)
+                        )
+                    base = step(latent, ignore)
+                step(
+                    eot_embed,
+                    ignore,
+                    output_hidden_states=False,
+                )
 
-            per_logits.append(torch.stack(logits_steps))
-            assert hidden_steps is not None
-            per_hidden.append([torch.stack(layer) for layer in hidden_steps])
-            per_labels.append(torch.stack(out_labels).long())
-
-        max_len = max(x.shape[0] for x in per_logits)
-        vocab_size = per_logits[0].shape[-1]
-        hidden_size = per_hidden[0][0].shape[-1]
-        num_layers = len(per_hidden[0])
-
-        logits = per_logits[0].new_zeros(batch_size, max_len, vocab_size)
-        student_labels = labels.new_full((batch_size, max_len), cfg.ignore_index)
-        student_mask = attention_mask.new_zeros(batch_size, max_len)
-        hidden_states = [
-            per_hidden[0][0].new_zeros(batch_size, max_len, hidden_size)
-            for _ in range(num_layers)
-        ]
-
-        for b in range(batch_size):
-            seq_len = per_logits[b].shape[0]
-            logits[b, :seq_len] = per_logits[b]
-            student_labels[b, :seq_len] = per_labels[b]
-            student_mask[b, :seq_len] = 1
-            for layer_idx in range(num_layers):
-                hidden_states[layer_idx][b, :seq_len] = per_hidden[b][layer_idx]
-
-        student_output = SimpleNamespace(
-            logits=logits,
-            hidden_states=tuple(hidden_states),
+        lm_loss = lm_loss_sum / lm_loss_count.clamp(min=1)
+        stacked_kd = (
+            [torch.stack(layer) for layer in student_kd_vecs]
+            if student_kd_vecs is not None
+            else None
         )
-        return student_output, student_labels, student_mask, orig_to_student
+        return (
+            lm_loss,
+            stacked_kd,
+            torch.tensor(student_pos, device=device, dtype=batch_idx.dtype),
+            student_model_calls,
+            student_tokens,
+        )
 
-    def _distill_positions(
+    def _teacher_positions(
         self,
         input_ids: torch.Tensor,
         labels: torch.Tensor,
         attention_mask: torch.Tensor,
-        orig_to_student_pos: torch.Tensor,
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         cfg = self.config
         batch_idx, action_pos = (input_ids == cfg.action_sep_token_id).nonzero(
             as_tuple=True
@@ -298,21 +334,7 @@ class CodiModel(nn.Module):
         valid &= labels[batch_idx, teacher_pos] != cfg.ignore_index
         if cfg.expected_action_next_token_id is not None:
             valid &= input_ids[batch_idx, teacher_pos] == cfg.expected_action_next_token_id
-        batch_idx = batch_idx[valid]
-        teacher_pos = teacher_pos[valid]
-
-        student_pos = orig_to_student_pos[batch_idx, teacher_pos]
-        valid = student_pos >= 0
-        return batch_idx[valid], teacher_pos[valid], student_pos[valid]
-
-    def _lm_loss(self, logits: torch.Tensor, labels: torch.Tensor) -> torch.Tensor:
-        if logits.shape[1] < 2:
-            return logits.sum() * 0.0
-        return F.cross_entropy(
-            logits[:, :-1].reshape(-1, logits.shape[-1]),
-            labels[:, 1:].reshape(-1),
-            ignore_index=self.config.ignore_index,
-        )
+        return batch_idx[valid], teacher_pos[valid]
 
     def _hidden_loss(
         self,
@@ -350,12 +372,39 @@ class CodiModel(nn.Module):
         ]
         return torch.stack(losses).mean()
 
+    def _teacher_kd_vecs(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: torch.Tensor,
+        batch_idx: torch.Tensor,
+        teacher_pos: torch.Tensor,
+    ) -> list[torch.Tensor] | None:
+        if batch_idx.numel() == 0:
+            return None
+
+        teacher_output = self.student(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            output_hidden_states=True,
+            use_cache=False,
+        )
+        return [
+            h[batch_idx, teacher_pos].detach()
+            for h in teacher_output.hidden_states[1:]
+        ]
+
+    def _timer(self, device: torch.device, enabled: bool) -> float:
+        if enabled and device.type == "cuda":
+            torch.cuda.synchronize(device)
+        return time.perf_counter()
+
     def forward(
         self,
         input_ids: torch.Tensor,
         *,
         labels: torch.Tensor | None = None,
         attention_mask: torch.Tensor | None = None,
+        profile: bool = False,
     ) -> CodiOutput:
         if attention_mask is None:
             attention_mask = torch.ones_like(input_ids)
@@ -365,28 +414,26 @@ class CodiModel(nn.Module):
                 self.config.ignore_index,
             )
 
-        student_output, student_labels, student_mask, orig_to_student_pos = (
-            self._streaming_student_outputs(input_ids, labels, attention_mask)
-        )
-
-        batch_idx, teacher_pos, student_pos = self._distill_positions(
+        batch_idx, teacher_pos = self._teacher_positions(
             input_ids,
             labels,
             attention_mask,
-            orig_to_student_pos,
         )
-        lm_loss = self._lm_loss(student_output.logits, student_labels)
-
-        # Slice student hidden states at KD positions and immediately free the
-        # full [B, max_student_len, H] tensors to reclaim VRAM before the
-        # teacher forward.
-        if batch_idx.numel() > 0:
-            student_kd_vecs: list[torch.Tensor] | None = [
-                h[batch_idx, student_pos] for h in student_output.hidden_states[1:]
-            ]
-        else:
-            student_kd_vecs = None
-        del student_output.hidden_states
+        start = self._timer(input_ids.device, profile)
+        (
+            lm_loss,
+            student_kd_vecs,
+            student_pos,
+            student_model_calls,
+            student_tokens,
+        ) = self._streaming_student_outputs(
+            input_ids,
+            labels,
+            attention_mask,
+            batch_idx,
+            teacher_pos,
+        )
+        student_s = self._timer(input_ids.device, profile) - start
 
         with torch.no_grad():
             disable_adapter = getattr(self.student, "disable_adapter", None)
@@ -398,26 +445,20 @@ class CodiModel(nn.Module):
             self.student.eval()
             try:
                 with disable_adapter():
-                    teacher_output = self.student(
-                        input_ids=input_ids,
-                        attention_mask=attention_mask,
-                        output_hidden_states=True,
-                        use_cache=False,
+                    start = self._timer(input_ids.device, profile)
+                    teacher_kd_vecs = self._teacher_kd_vecs(
+                        input_ids,
+                        attention_mask,
+                        batch_idx,
+                        teacher_pos,
                     )
+                    teacher_s = self._timer(input_ids.device, profile) - start
             finally:
                 self.student.train(was_training)
 
-            # Slice at KD positions and free the full [B, L, H] teacher tensors.
-            if batch_idx.numel() > 0:
-                teacher_kd_vecs: list[torch.Tensor] | None = [
-                    h[batch_idx, teacher_pos].detach()
-                    for h in teacher_output.hidden_states[1:]
-                ]
-            else:
-                teacher_kd_vecs = None
-            del teacher_output
-
-        kd_loss = self._kd_loss(student_kd_vecs, teacher_kd_vecs, student_output.logits)
+        start = self._timer(input_ids.device, profile)
+        kd_loss = self._kd_loss(student_kd_vecs, teacher_kd_vecs, lm_loss)
+        kd_s = self._timer(input_ids.device, profile) - start
         loss = self.config.lm_loss_weight * lm_loss + self.config.kd_loss_weight * kd_loss
         kd_positions = torch.stack((batch_idx, teacher_pos, student_pos), dim=1)
         metrics = {
@@ -428,16 +469,17 @@ class CodiModel(nn.Module):
                 batch_idx.numel(),
                 device=input_ids.device,
             ),
+            "time_student_s": torch.tensor(student_s, device=input_ids.device),
+            "time_teacher_s": torch.tensor(teacher_s, device=input_ids.device),
+            "time_kd_s": torch.tensor(kd_s, device=input_ids.device),
+            "student_model_calls": torch.tensor(student_model_calls, device=input_ids.device),
+            "student_tokens": torch.tensor(student_tokens, device=input_ids.device),
         }
 
         return CodiOutput(
             loss=loss,
             lm_loss=lm_loss,
             kd_loss=kd_loss,
-            logits=student_output.logits,
-            labels=student_labels,
-            attention_mask=student_mask,
-            orig_to_student_pos=orig_to_student_pos,
             kd_positions=kd_positions,
             metrics=metrics,
         )

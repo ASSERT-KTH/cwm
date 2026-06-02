@@ -1,9 +1,8 @@
 #!/bin/bash
 #SBATCH -J cwm-codi-train
 #SBATCH -t 24:00:00
-#SBATCH -N 1
-#SBATCH --gpus=8
-#SBATCH -C "thin"
+#SBATCH --gpus=2
+#SBATCH -C "fat"
 #SBATCH -o logs/codi_train_%j.out
 #SBATCH -e logs/codi_train_%j.err
 
@@ -34,12 +33,10 @@ export TORCH_NCCL_TRACE_BUFFER_SIZE=1048576 # flight recorder: dump where each r
 
 mkdir -p ${OUT} logs
 
-# torchrun sets WORLD_SIZE/RANK/LOCAL_RANK. With tp_size=8, dp_size=1, every
-# rank consumes the same batch and participates in each tensor-parallel layer.
-torchrun --standalone --nproc_per_node=8 -m cwm.training.train \
+torchrun --standalone --nproc_per_node=2 -m cwm.training.train \
     model_name_or_path=model_weights/cwm_hf \
     output_dir=${OUT} \
     latent_steps=2 n_samples=-1 max_seq_len=2048 epochs=1 \
     batch_size=4 grad_accum_steps=1 \
-    device_map=none tp_size=8 dp_size=1 pp_size=1 tp_plan=auto \
-    flash_attn=true wandb_log=true
+    device_map=none tp_size=2 dp_size=1 pp_size=1 tp_plan=auto \
+    flash_attn=true wandb_log=true timing_log_every=1

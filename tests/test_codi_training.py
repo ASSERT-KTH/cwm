@@ -50,8 +50,8 @@ def test_codi_loss_backprops_only_to_student() -> None:
 
     output = model(input_ids, labels=labels, attention_mask=attention_mask)
 
-    assert output.logits.shape[:2] == output.labels.shape
     assert output.kd_positions.shape == (2, 3)
+    assert output.metrics["num_kd_positions"].item() == 2
     assert output.loss.requires_grad
 
     output.loss.backward()

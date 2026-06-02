@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -49,7 +50,8 @@ class TrainArgs:
     seed: int = 42
     wandb_log: bool = False
     wandb_name: str = ""
-    wandb_log_every: int = 10  # optimizer steps per wandb log point
+    wandb_log_every: int = 1
+    timing_log_every: int = 0  # 0 = disabled; log rank0 timing every N optimizer steps
     device_map: str = "auto"
     num_workers: int = 16
     flash_attn: bool = True   # sdpa fused-kernel attention (no extra package needed)
@@ -243,12 +245,10 @@ def main(args: TrainArgs) -> None:
             model.to(dist_state.device)
         model.train()
 
-        # enable_input_require_grads lets gradients flow through the frozen base
-        # embeddings to reach LoRA adapters. Gradient checkpointing is intentionally
-        # omitted: the step-by-step KV-cache forward in CodiModel is incompatible
-        # with GC (HF forces use_cache=False, which breaks past_key_values
-        # accumulation and causes both correctness bugs and near-zero GPU utilization).
-        model.student.enable_input_require_grads()
+        # Gradient checkpointing is intentionally omitted: the step-by-step
+        # KV-cache forward in CodiModel requires use_cache=True. LoRA weights get
+        # gradients without forcing frozen embedding outputs to require grad; the
+        # latter only bloats the long streaming autograd graph.
 
         pad_id = (
             tokenizer.pad_token_id
@@ -355,8 +355,32 @@ def main(args: TrainArgs) -> None:
 
         step = 0
 
-        def optimizer_step(epoch: int, window: dict, accum_batches: int) -> None:
+        profile_this_rank = args.timing_log_every > 0 and dist_state.is_rank_zero
+
+        def timing_stamp() -> float:
+            if profile_this_rank and dist_state.device.type == "cuda":
+                torch.cuda.synchronize(dist_state.device)
+            return time.perf_counter()
+
+        def new_timing() -> dict:
+            return {
+                "data": 0.0,
+                "h2d": 0.0,
+                "forward": 0.0,
+                "student": 0.0,
+                "teacher": 0.0,
+                "kd_compute": 0.0,
+                "backward": 0.0,
+                "optimizer": 0.0,
+                "student_calls": 0.0,
+                "student_tokens": 0.0,
+            }
+
+        def optimizer_step(
+            epoch: int, window: dict, accum_batches: int, timing: dict
+        ) -> None:
             nonlocal step
+            opt_start = timing_stamp()
             # Partial final window: rescale grads so the average matches a full window.
             if accum_batches < args.grad_accum_steps:
                 scale = args.grad_accum_steps / accum_batches
@@ -367,6 +391,7 @@ def main(args: TrainArgs) -> None:
             grad_norm = torch.nn.utils.clip_grad_norm_(params, args.max_grad_norm)
             optimizer.step()
             optimizer.zero_grad()
+            timing["optimizer"] += timing_stamp() - opt_start
             step += 1
 
             metrics = torch.tensor(
@@ -414,6 +439,33 @@ def main(args: TrainArgs) -> None:
                         },
                         step=step,
                     )
+            if profile_this_rank and step % args.timing_log_every == 0:
+                total = (
+                    timing["data"]
+                    + timing["h2d"]
+                    + timing["forward"]
+                    + timing["backward"]
+                    + timing["optimizer"]
+                )
+                logger.info(
+                    "timing step %d total=%.3fs data=%.3f h2d=%.3f "
+                    "forward=%.3f student=%.3f teacher=%.3f kd_compute=%.3f "
+                    "backward=%.3f optimizer=%.3f student_calls=%.0f "
+                    "student_tokens=%.0f accum_batches=%d",
+                    step,
+                    total,
+                    timing["data"],
+                    timing["h2d"],
+                    timing["forward"],
+                    timing["student"],
+                    timing["teacher"],
+                    timing["kd_compute"],
+                    timing["backward"],
+                    timing["optimizer"],
+                    timing["student_calls"],
+                    timing["student_tokens"],
+                    accum_batches,
+                )
             if args.save_every_steps and step % args.save_every_steps == 0:
                 save_checkpoint(out_dir / f"checkpoint-{step}")
 
@@ -426,19 +478,41 @@ def main(args: TrainArgs) -> None:
                 sampler.set_epoch(epoch)
             accum_batches = 0
             window = new_window()
+            timing = new_timing()
             num_batches = len(loader)
-            for batch_idx, batch in enumerate(loader):
-                batch = {k: v.to(device) for k, v in batch.items()}
+            loader_iter = iter(loader)
+            for batch_idx in range(num_batches):
+                start = timing_stamp()
+                batch = next(loader_iter)
+                timing["data"] += timing_stamp() - start
+
+                start = timing_stamp()
+                batch = {k: v.to(device, non_blocking=True) for k, v in batch.items()}
+                timing["h2d"] += timing_stamp() - start
+
                 will_step = (
                     accum_batches + 1 == args.grad_accum_steps
                     or batch_idx + 1 == num_batches
                 )
+
+                start = timing_stamp()
                 out = model(
                     batch["input_ids"],
                     labels=batch["labels"],
                     attention_mask=batch["attention_mask"],
+                    profile=profile_this_rank,
                 )
+                timing["forward"] += timing_stamp() - start
+                if profile_this_rank:
+                    timing["student"] += out.metrics["time_student_s"].item()
+                    timing["teacher"] += out.metrics["time_teacher_s"].item()
+                    timing["kd_compute"] += out.metrics["time_kd_s"].item()
+                    timing["student_calls"] += out.metrics["student_model_calls"].item()
+                    timing["student_tokens"] += out.metrics["student_tokens"].item()
+
+                start = timing_stamp()
                 (out.loss / args.grad_accum_steps).backward()
+                timing["backward"] += timing_stamp() - start
 
                 accum_batches += 1
                 window["loss"] += out.loss.item()
@@ -447,9 +521,10 @@ def main(args: TrainArgs) -> None:
                 window["kd_pos"] += out.metrics["num_kd_positions"].item()
 
                 if will_step:
-                    optimizer_step(epoch, window, accum_batches)
+                    optimizer_step(epoch, window, accum_batches, timing)
                     accum_batches = 0
                     window = new_window()
+                    timing = new_timing()
 
         if torch.cuda.is_available():
             peak_alloc = torch.cuda.max_memory_allocated(dist_state.device) / 1024**3
