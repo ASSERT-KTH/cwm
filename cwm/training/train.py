@@ -90,6 +90,9 @@ def main(args: TrainArgs) -> None:
     loader = DataLoader(
         dataset, batch_size=args.batch_size, shuffle=True, collate_fn=lambda b: _collate(b, pad_id)
     )
+    if args.grad_accum_steps <= 0:
+        raise ValueError("grad_accum_steps must be positive")
+
     params = [p for p in model.parameters() if p.requires_grad]
     logger.info("%d examples, %d trainable params", len(dataset), sum(p.numel() for p in params))
     optimizer = torch.optim.AdamW(params, lr=args.lr)
@@ -100,24 +103,46 @@ def main(args: TrainArgs) -> None:
         wandb.init(project="codi-cruxeval", config=vars(args))
 
     step = 0
+
+    def optimizer_step(epoch: int, out, accum_batches: int) -> None:
+        nonlocal step
+        if accum_batches < args.grad_accum_steps:
+            scale = args.grad_accum_steps / accum_batches
+            for param in params:
+                if param.grad is not None:
+                    param.grad.mul_(scale)
+        torch.nn.utils.clip_grad_norm_(params, args.max_grad_norm)
+        optimizer.step()
+        optimizer.zero_grad()
+        step += 1
+        logger.info(
+            "epoch %d step %d loss=%.4f lm=%.4f kd=%.4f kd_pos=%d",
+            epoch, step, out.loss.item(), out.lm_loss.item(), out.kd_loss.item(),
+            int(out.metrics["num_kd_positions"].item()),
+        )
+
     optimizer.zero_grad()
+    accum_batches = 0
+    last_out = None
     for epoch in range(args.epochs):
-        for i, batch in enumerate(loader):
+        for batch in loader:
             batch = {k: v.to(device) for k, v in batch.items()}
             out = model(batch["input_ids"], labels=batch["labels"],
                         attention_mask=batch["attention_mask"], wandb_step=step)
             (out.loss / args.grad_accum_steps).backward()
+            accum_batches += 1
+            last_out = out
 
-            if (i + 1) % args.grad_accum_steps == 0:
-                torch.nn.utils.clip_grad_norm_(params, args.max_grad_norm)
-                optimizer.step()
-                optimizer.zero_grad()
-                step += 1
-                logger.info(
-                    "epoch %d step %d loss=%.4f lm=%.4f kd=%.4f kd_pos=%d",
-                    epoch, step, out.loss.item(), out.lm_loss.item(), out.kd_loss.item(),
-                    int(out.metrics["num_kd_positions"].item()),
-                )
+            if accum_batches == args.grad_accum_steps:
+                optimizer_step(epoch, out, accum_batches)
+                accum_batches = 0
+                last_out = None
+
+        if accum_batches:
+            assert last_out is not None
+            optimizer_step(epoch, last_out, accum_batches)
+            accum_batches = 0
+            last_out = None
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)

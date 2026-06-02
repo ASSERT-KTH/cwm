@@ -173,6 +173,9 @@ class CodiModel(nn.Module):
                 nn.Linear(hidden_size, hidden_size, bias=False),
                 nn.LayerNorm(hidden_size),
             )
+            # Match student embedding device/dtype (sharded bf16 loading).
+            ref = self.input_embeddings.weight
+            self.thought_projector.to(device=ref.device, dtype=ref.dtype)
         self._wandb_step = 0
 
     @property
@@ -281,7 +284,8 @@ class CodiModel(nn.Module):
                 for _ in range(cfg.latent_steps):
                     latent = base
                     if self.thought_projector is not None:
-                        latent = self.thought_projector(latent)
+                        p = next(self.thought_projector.parameters())
+                        latent = self.thought_projector(latent.to(device=p.device, dtype=p.dtype))
                     base = step(latent)
                     out_labels.append(labels.new_tensor(cfg.ignore_index))
                 step(self._token_embed(cfg.eot_token_id, device))
@@ -322,6 +326,7 @@ class CodiModel(nn.Module):
     def _distill_positions(
         self,
         input_ids: torch.Tensor,
+        labels: torch.Tensor,
         attention_mask: torch.Tensor,
         orig_to_student_pos: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -335,6 +340,7 @@ class CodiModel(nn.Module):
         teacher_pos = teacher_pos[valid]
 
         valid = attention_mask[batch_idx, teacher_pos].bool()
+        valid &= labels[batch_idx, teacher_pos] != cfg.ignore_index
         if cfg.expected_action_next_token_id is not None:
             valid &= input_ids[batch_idx, teacher_pos] == cfg.expected_action_next_token_id
         batch_idx = batch_idx[valid]
@@ -466,6 +472,7 @@ class CodiModel(nn.Module):
 
         batch_idx, teacher_pos, student_pos = self._distill_positions(
             input_ids,
+            labels,
             attention_mask,
             orig_to_student_pos,
         )

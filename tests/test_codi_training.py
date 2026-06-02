@@ -67,3 +67,29 @@ def test_codi_loss_backprops_only_to_student() -> None:
     assert all(p.grad is not None for _, p in trainable)
     assert all(p.grad is None for _, p in frozen)
 
+
+
+def test_codi_kd_positions_ignore_masked_prompt_tokens() -> None:
+    torch.manual_seed(0)
+    teacher = _tiny_model()
+    student = _tiny_model()
+    student.load_state_dict(teacher.state_dict())
+
+    config = CodiConfig(
+        line_sep_token_id=10,
+        sot_token_id=11,
+        eot_token_id=12,
+        action_sep_token_id=13,
+        latent_steps=1,
+        expected_action_next_token_id=9,
+    )
+    model = CodiModel(teacher=teacher, student=student, config=config)
+
+    input_ids = torch.tensor([[2, 13, 9, 10, 7, 13, 9, 3]])
+    attention_mask = torch.ones_like(input_ids)
+    labels = input_ids.clone()
+    labels[:, :4] = config.ignore_index
+
+    output = model(input_ids, labels=labels, attention_mask=attention_mask)
+
+    assert output.kd_positions.tolist() == [[0, 6, 9]]
