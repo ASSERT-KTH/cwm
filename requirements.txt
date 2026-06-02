@@ -15,9 +15,11 @@ ninja
 numpy
 omegaconf==2.4.0.dev4
 openai==1.86.0
+peft
 rich
 swebench
 tenacity
+wandb
 tiktoken
 torch==2.7.1
 unidiff
