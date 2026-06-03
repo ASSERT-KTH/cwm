@@ -12,8 +12,17 @@ with the prompt prefix set to ``-100``).
 
 from __future__ import annotations
 
+from functools import partial
+
+import torch
+import torch.distributed as dist
+from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
+
 from evals.trace_analysis.ground_truth import ground_truth_trace, make_trace_context
 from evals.trace_analysis.trace_format import render_frames_to_generation
+
+from cwm.training.distributed import DistState
 
 IGNORE_INDEX = -100
 
@@ -53,3 +62,64 @@ def build_dataset(tokenizer, *, n_samples: int = -1, max_seq_len: int = 8192) ->
         rows = rows[:n_samples]
     examples = (build_example(r["code"], r["input"], tokenizer, max_seq_len=max_seq_len) for r in rows)
     return [ex for ex in examples if ex is not None]
+
+
+def collate_codi_batch(batch, pad_id: int) -> dict[str, torch.Tensor]:
+    max_len = max(len(ids) for ids, _ in batch)
+    input_ids, labels, attn = [], [], []
+    for ids, lab in batch:
+        pad = max_len - len(ids)
+        input_ids.append(ids + [pad_id] * pad)
+        labels.append(lab + [IGNORE_INDEX] * pad)
+        attn.append([1] * len(ids) + [0] * pad)
+    return {
+        "input_ids": torch.tensor(input_ids),
+        "labels": torch.tensor(labels),
+        "attention_mask": torch.tensor(attn),
+    }
+
+
+def build_codi_dataloader(
+    *,
+    tokenizer,
+    pad_id: int,
+    dist_state: DistState,
+    n_samples: int,
+    max_seq_len: int,
+    batch_size: int,
+    num_workers: int,
+    seed: int,
+) -> tuple[DataLoader, DistributedSampler | None]:
+    if dist_state.is_rank_zero or not dist_state.enabled:
+        dataset = build_dataset(tokenizer, n_samples=n_samples, max_seq_len=max_seq_len)
+    else:
+        dataset = None
+
+    if dist_state.enabled:
+        obj = [dataset]
+        dist.broadcast_object_list(obj, src=0, device=dist_state.device)
+        dataset = obj[0]
+
+    sampler = (
+        DistributedSampler(
+            dataset,
+            num_replicas=dist_state.dp_size,
+            rank=dist_state.dp_rank,
+            shuffle=True,
+            seed=seed,
+        )
+        if dist_state.dp_enabled
+        else None
+    )
+
+    loader = DataLoader(
+        dataset,
+        batch_size=batch_size,
+        shuffle=sampler is None,
+        sampler=sampler,
+        collate_fn=partial(collate_codi_batch, pad_id=pad_id),
+        num_workers=num_workers,
+        pin_memory=True,
+        generator=torch.Generator().manual_seed(seed),
+    )
+    return loader, sampler
