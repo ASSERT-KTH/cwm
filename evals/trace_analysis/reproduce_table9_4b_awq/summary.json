@@ -1,0 +1,18 @@
+{
+  "table9": {
+    "n": 800,
+    "output_pass_at_1": 87.0,
+    "valid_trace_format": 99.75,
+    "state_exact_match": 96.36851289370655,
+    "action_exact_match": 98.69006630309637,
+    "valid_json_format": 99.53407235134854,
+    "key_match": 99.53407235134854,
+    "key_value_match": 97.44542254106105,
+    "avg_state_tokens": 14.288510645338853,
+    "avg_action_tokens": 9.213016158393241
+  },
+  "n_total": 800,
+  "decoding": "greedy",
+  "model": "./model_weights/cwm-awq-4bit",
+  "loader": "vllm"
+}

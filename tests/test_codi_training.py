@@ -212,6 +212,30 @@ def test_checkpoint_preserves_latent_gradient() -> None:
     assert any("lora_" in n for n in with_grad)
 
 
+def test_kd_layers_subset_restricts_distilled_layers() -> None:
+    torch.manual_seed(0)
+    config = CodiConfig(
+        latent_span_start_token_id=10,
+        latent_span_end_token_id=13,
+        latent_steps=2,
+        latent_start_token_id=11,
+        latent_end_token_id=12,
+        kd_layers=(-1,),  # last transformer layer only
+    )
+    model = CodiModel(student=_tiny_model(), config=config)
+
+    input_ids = torch.tensor([[2, 5, 10, 7, 13, 9, 3]])
+    attention_mask = torch.ones_like(input_ids)
+    labels = input_ids.clone()
+
+    _, kd, _, _, _ = streaming_student_outputs(
+        model, input_ids, labels, attention_mask, *model._teacher_positions(input_ids, labels, attention_mask)
+    )
+    assert len(kd) == 1  # _tiny_model has 2 layers; only the last is distilled
+    out = model(input_ids, labels=labels, attention_mask=attention_mask)
+    assert torch.isfinite(out.kd_loss)
+
+
 def test_codi_kd_positions_ignore_masked_prompt_tokens() -> None:
     torch.manual_seed(0)
     student = _tiny_model()

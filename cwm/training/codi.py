@@ -5,7 +5,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from cwm.training.codi_config import CodiConfig, apply_lora
+from cwm.training.codi_config import CodiConfig, apply_lora, select_kd_layers
 from cwm.training.codi_streaming import streaming_student_outputs
 
 
@@ -130,25 +130,16 @@ class CodiModel(nn.Module):
                 continue
             valid_len = int(attention_mask[b].sum().item())
             row_ids = input_ids[b : b + 1, :valid_len]
+            # Decoder-only forward (skips lm_head); fall back to the full student
+            # for architectures without a separate decoder/lm_head split.
             causal_lm = self._causal_lm_module()
-            if causal_lm is not None:
-                out = causal_lm.model(
-                    input_ids=row_ids,
-                    output_hidden_states=True,
-                    use_cache=False,
-                )
-                hidden_states = out.hidden_states
-            else:
-                out = self.student(
-                    input_ids=row_ids,
-                    output_hidden_states=True,
-                    use_cache=False,
-                )
-                hidden_states = out.hidden_states
+            module = causal_lm.model if causal_lm is not None else self.student
+            out = module(input_ids=row_ids, output_hidden_states=True, use_cache=False)
+            layers = select_kd_layers(out.hidden_states, self.config.kd_layers)
             if teacher_kd is None:
-                teacher_kd = [[] for _ in hidden_states[1:]]
+                teacher_kd = [[] for _ in layers]
             positions = teacher_pos[row_mask]
-            for layer_kd, h in zip(teacher_kd, hidden_states[1:], strict=True):
+            for layer_kd, h in zip(teacher_kd, layers, strict=True):
                 layer_kd.extend(h[0, positions])
         return [torch.stack(layer).detach() for layer in teacher_kd]
 

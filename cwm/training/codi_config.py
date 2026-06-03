@@ -20,6 +20,7 @@ class CodiConfig:
     kd_loss: Literal["l1", "smooth_l1", "mse"] = "l1"
     normalize_kd_by_teacher_std: bool = True
     kd_eps: float = 1e-6
+    kd_layers: tuple[int, ...] | None = None
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
@@ -46,6 +47,19 @@ class CodiConfig:
             raise ValueError("lora_dropout must be non-negative")
 
 
+def select_kd_layers(hidden_states, kd_layers: tuple[int, ...] | None):
+    """Per-layer hidden states to distill (drops the embedding layer at index 0).
+
+    ``kd_layers`` selects a subset by index (negatives allowed, e.g. ``(-1,)`` for
+    last layer only); ``None`` keeps every transformer layer. Teacher and student
+    must pass the same ``kd_layers`` so the per-layer KD lists line up.
+    """
+    layers = hidden_states[1:]
+    if kd_layers is None:
+        return layers
+    return tuple(layers[i] for i in kd_layers)
+
+
 def cwm_token_id(tokenizer, token: str) -> int:
     token_id = tokenizer.convert_tokens_to_ids(token)
     if token_id is not None and token_id != tokenizer.unk_token_id:
@@ -61,6 +75,7 @@ def default_codi_config_from_tokenizer(
     tokenizer,
     *,
     latent_steps: int,
+    kd_layers: tuple[int, ...] | None = None,
 ) -> CodiConfig:
     return CodiConfig(
         latent_span_start_token_id=cwm_token_id(tokenizer, "<|line_sep|>"),
@@ -68,6 +83,7 @@ def default_codi_config_from_tokenizer(
         latent_start_token_id=cwm_token_id(tokenizer, "<|reasoning_thinking_start|>"),
         latent_end_token_id=cwm_token_id(tokenizer, "<|reasoning_thinking_end|>"),
         latent_steps=latent_steps,
+        kd_layers=kd_layers,
     )
 
 

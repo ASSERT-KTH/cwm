@@ -8,6 +8,8 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from transformers.cache_utils import DynamicCache
 
+from cwm.training.codi_config import select_kd_layers
+
 HiddenRequest = Literal["none", "all_layers", "last_layer"]
 
 
@@ -290,10 +292,11 @@ class _StreamingStudent:
     def _collect_kd(
         self, row: int, offsets: list[int], start_pos: int, hidden_states: tuple
     ) -> None:
+        layers = select_kd_layers(hidden_states, self.cfg.kd_layers)
         if self.kd_by_row[row] is None:
-            self.kd_by_row[row] = [[] for _ in hidden_states[1:]]
+            self.kd_by_row[row] = [[] for _ in layers]
         idx = torch.tensor(offsets, device=hidden_states[0].device)
-        for layer_kd, hidden in zip(self.kd_by_row[row], hidden_states[1:], strict=True):
+        for layer_kd, hidden in zip(self.kd_by_row[row], layers, strict=True):
             layer_kd.extend(hidden[row, idx])
         self.kd_pos_by_row[row].extend(start_pos + off for off in offsets)
 

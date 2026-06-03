@@ -39,7 +39,8 @@ logger = logging.getLogger(__name__)
 class TrainArgs:
     model_name_or_path: str = "facebook/cwm"
     output_dir: str = "./codi-cruxeval"
-    latent_steps: int = 6
+    latent_steps: int = 2
+    kd_layers: list[int] | None = None  # None = all layers; e.g. [-1] for last only
     use_thought_projector: bool = True
     lr: float = 1e-4
     epochs: int = 1
@@ -71,7 +72,9 @@ def main(args: TrainArgs) -> None:
         tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
 
         config = default_codi_config_from_tokenizer(
-            tokenizer, latent_steps=args.latent_steps
+            tokenizer,
+            latent_steps=args.latent_steps,
+            kd_layers=tuple(args.kd_layers) if args.kd_layers else None,
         )
 
         load_device_map = args.device_map
