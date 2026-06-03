@@ -43,7 +43,7 @@ class _StreamingStudent:
     positions. The latent embedding at each step is produced from the previous
     step's last hidden state, so the pass is inherently sequential.
 
-    With ``gradient_checkpointing`` every student call recomputes its activations
+    Whenever grad is enabled every student call recomputes its activations
     during backward instead of storing them, which removes the dominant memory
     cost of the long streaming graph. The recompute must be pure, so instead of
     mutating one shared KV cache (which would double-append on recompute) each
@@ -62,8 +62,6 @@ class _StreamingStudent:
         attention_mask: torch.Tensor,
         batch_idx: torch.Tensor,
         teacher_pos: torch.Tensor,
-        *,
-        gradient_checkpointing: bool,
     ) -> None:
         self.model = model
         self.cfg = model.config
@@ -72,7 +70,6 @@ class _StreamingStudent:
         self.device = input_ids.device
         self.embed = model.input_embeddings
         self.hidden = self.embed.weight.shape[-1]
-        self.gradient_checkpointing = gradient_checkpointing
         self.batch_size = input_ids.shape[0]
         self._pos_dtype = batch_idx.dtype
 
@@ -134,16 +131,28 @@ class _StreamingStudent:
             use_cache=True,
         )
         causal_lm = self.model._causal_lm_module()
-        if hidden_request == "last_layer" and causal_lm is not None:
-            out = causal_lm.model(**kw)
+        if causal_lm is not None:
+            # Unified path so every call hits the decoder (whose layers are
+            # compiled in place by CodiModel). lm_head stays eager; the full
+            # hidden-state tuple is requested only for KD.
+            want_hidden = hidden_request == "all_layers"
+            out = causal_lm.model(**kw, output_hidden_states=want_hidden)
+            last_hidden = out.last_hidden_state if hidden_request == "last_layer" else None
+            hidden_states = out.hidden_states if want_hidden else None
             logits = causal_lm.lm_head(out.last_hidden_state) if compute_logits else None
-            return logits, out.last_hidden_state, None, out.past_key_values
-        if hidden_request == "last_layer":
-            out = self.model.student(**kw, output_hidden_states=True)
-            logits = out.logits if compute_logits else None
-            return logits, out.hidden_states[-1], out.hidden_states, out.past_key_values
-        out = self.model.student(**kw, output_hidden_states=hidden_request == "all_layers")
-        return out.logits, None, out.hidden_states, out.past_key_values
+            return logits, last_hidden, hidden_states, out.past_key_values
+
+        # Fallback for models without a separate decoder/lm_head split (tests use
+        # the causal_lm path above; this keeps the contract for odd architectures).
+        out = self.model.student(**kw, output_hidden_states=hidden_request != "none")
+        logits = out.logits if compute_logits else None
+        last_hidden = (
+            out.hidden_states[-1]
+            if hidden_request == "last_layer" and out.hidden_states is not None
+            else None
+        )
+        hidden_states = out.hidden_states if hidden_request == "all_layers" else None
+        return logits, last_hidden, hidden_states, out.past_key_values
 
     def _forward_rebuild(
         self,
@@ -194,7 +203,7 @@ class _StreamingStudent:
         pos_ids = pos[:, None] + torch.arange(step_embeds.shape[1], device=self.device)
         full_mask = torch.cat([self.cache_mask, step_mask], dim=1)
 
-        if self.gradient_checkpointing and torch.is_grad_enabled():
+        if torch.is_grad_enabled():
             # Snapshot the current chunks (the live list is mutated below, and the
             # checkpoint holds its args by reference until the backward recompute).
             args = (
@@ -322,7 +331,7 @@ class _StreamingStudent:
         if not rows:
             return
         row_idx = torch.tensor(rows, device=self.device)
-        if self.gradient_checkpointing and torch.is_grad_enabled():
+        if torch.is_grad_enabled():
             self._latent_block_checkpointed(rows, row_idx)
         else:
             self._latent_block_plain(rows, row_idx)
@@ -508,8 +517,6 @@ def streaming_student_outputs(
     attention_mask: torch.Tensor,
     batch_idx: torch.Tensor,
     teacher_pos: torch.Tensor,
-    *,
-    gradient_checkpointing: bool = False,
 ) -> tuple[torch.Tensor, list[torch.Tensor] | None, torch.Tensor, int, int]:
     return _StreamingStudent(
         model,
@@ -518,5 +525,4 @@ def streaming_student_outputs(
         attention_mask,
         batch_idx,
         teacher_pos,
-        gradient_checkpointing=gradient_checkpointing,
     ).run()

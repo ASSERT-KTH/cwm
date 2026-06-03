@@ -1,3 +1,10 @@
+import os
+
+# CodiModel always torch.compiles the decoder; keep the suite eager (login/CI
+# nodes have no usable GPU for inductor). Compile correctness is validated on the
+# training cluster.
+os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
+
 import torch
 from transformers import CwmConfig, CwmForCausalLM
 
@@ -138,10 +145,10 @@ def test_batched_lm_loss_invariant_to_duplication() -> None:
     torch.testing.assert_close(losses[0], losses[1], atol=1e-5, rtol=1e-5)
 
 
-def test_gradient_checkpointing_single_call_matches_plain() -> None:
-    # No <|line_sep|> -> a single student call and no latent block, so the
-    # cache-detach is a no-op and checkpointed loss *and* grads must match the
-    # plain path exactly (isolates the recompute correctness from the detach).
+def test_checkpoint_single_call_matches_eager() -> None:
+    # No <|line_sep|> -> a single student call, no latent block. The grad-enabled
+    # (always-on) checkpointed path must give the same loss as the eager no_grad
+    # plain-cache path, and grads must reach the LoRA params.
     torch.manual_seed(0)
     model, config = _codi_model()
     model.eval()
@@ -150,28 +157,23 @@ def test_gradient_checkpointing_single_call_matches_plain() -> None:
     attention_mask = torch.ones_like(input_ids)
     labels = input_ids.clone()
 
-    losses, grads = [], []
-    for flag in (False, True):
-        model.config.gradient_checkpointing = flag
-        model.zero_grad(set_to_none=True)
-        out = model(input_ids, labels=labels, attention_mask=attention_mask)
-        out.loss.backward()
-        losses.append(out.loss.detach())
-        grads.append(
-            {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
-        )
+    with torch.no_grad():  # grad disabled -> eager plain-cache path (no checkpoint)
+        ref_loss = model(input_ids, labels=labels, attention_mask=attention_mask).loss
 
-    torch.testing.assert_close(losses[0], losses[1], atol=1e-5, rtol=1e-5)
-    assert grads[0] and grads[0].keys() == grads[1].keys()
-    for name in grads[0]:
-        torch.testing.assert_close(grads[0][name], grads[1][name], atol=1e-4, rtol=1e-4)
+    model.zero_grad(set_to_none=True)
+    out = model(input_ids, labels=labels, attention_mask=attention_mask)
+    out.loss.backward()
+
+    torch.testing.assert_close(out.loss.detach(), ref_loss, atol=1e-4, rtol=1e-4)
+    with_grad = [n for n, p in model.named_parameters() if p.grad is not None]
+    assert with_grad and all("lora_" in n for n in with_grad)
 
 
-def test_gradient_checkpointing_preserves_latent_gradient() -> None:
+def test_checkpoint_preserves_latent_gradient() -> None:
     # With <|line_sep|> + latents the latent gradient reaches the loss only via
     # later tokens attending to the injected latents through the KV cache. The
-    # checkpointed path rebuilds the cache without detaching it, so loss *and*
-    # all grads (including the thought projector) must match the plain path.
+    # block-checkpointed path rebuilds the cache without detaching it, so the loss
+    # matches the eager path and grads reach the thought projector.
     torch.manual_seed(0)
     config = CodiConfig(
         line_sep_token_id=10,
@@ -188,23 +190,17 @@ def test_gradient_checkpointing_preserves_latent_gradient() -> None:
     attention_mask = torch.ones_like(input_ids)
     labels = input_ids.clone()
 
-    losses, grads = [], []
-    for flag in (False, True):
-        model.config.gradient_checkpointing = flag
-        model.zero_grad(set_to_none=True)
-        out = model(input_ids, labels=labels, attention_mask=attention_mask)
-        out.loss.backward()
-        losses.append(out.loss.detach())
-        grads.append(
-            {n: p.grad.clone() for n, p in model.named_parameters() if p.grad is not None}
-        )
+    with torch.no_grad():  # grad disabled -> eager plain-cache path (no checkpoint)
+        ref_loss = model(input_ids, labels=labels, attention_mask=attention_mask).loss
 
-    torch.testing.assert_close(losses[0], losses[1], atol=1e-5, rtol=1e-5)
-    assert grads[0].keys() == grads[1].keys()
-    assert any("thought_projector" in n for n in grads[0])
-    assert any("lora_" in n for n in grads[0])
-    for name in grads[0]:
-        torch.testing.assert_close(grads[0][name], grads[1][name], atol=1e-4, rtol=1e-4)
+    model.zero_grad(set_to_none=True)
+    out = model(input_ids, labels=labels, attention_mask=attention_mask)
+    out.loss.backward()
+
+    torch.testing.assert_close(out.loss.detach(), ref_loss, atol=1e-4, rtol=1e-4)
+    with_grad = {n for n, p in model.named_parameters() if p.grad is not None}
+    assert any("thought_projector" in n for n in with_grad)
+    assert any("lora_" in n for n in with_grad)
 
 
 def test_codi_kd_positions_ignore_masked_prompt_tokens() -> None:

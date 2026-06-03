@@ -43,6 +43,25 @@ class CodiModel(nn.Module):
             ref = self.input_embeddings.weight
             self.thought_projector.to(device=ref.device, dtype=ref.dtype)
 
+        # The streaming pass is CPU/dispatch-bound: hundreds of sequential
+        # decoder calls, each layer multiplied by the PEFT per-linear wrappers
+        # and nn.Module machinery (~70% of the py-spy profile). Compile each
+        # decoder layer in place rather than the whole stack -- that dispatch
+        # hotspot lives inside one layer, so a single small per-layer graph
+        # (reused across every layer and call) collapses the same Python overhead
+        # while compiling in seconds and tolerating the streaming pass's varying
+        # query width / KV-cache length far better than one giant dynamic graph
+        # over all layers. lm_head and the outer model stay eager; `_call_model`
+        # calls `causal_lm.model` directly and transparently runs the compiled
+        # layers. dynamic=True because both the query width and the KV-cache
+        # length change every call. Always on (the optimal path); set
+        # TORCHDYNAMO_DISABLE=1 to fall back to eager (e.g. tests).
+        causal_lm = self._causal_lm_module()
+        if causal_lm is not None:
+            layers = causal_lm.model.layers
+            for i in range(len(layers)):
+                layers[i] = torch.compile(layers[i], dynamic=True)
+
     @property
     def input_embeddings(self) -> nn.Module:
         return self.student.get_input_embeddings()
@@ -187,7 +206,6 @@ class CodiModel(nn.Module):
             attention_mask,
             batch_idx,
             teacher_pos,
-            gradient_checkpointing=self.config.gradient_checkpointing,
         )
 
         with torch.no_grad():

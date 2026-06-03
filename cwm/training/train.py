@@ -60,7 +60,6 @@ class TrainArgs:
     tp_size: int = 1
     dp_size: int = 0  # 0 = infer from WORLD_SIZE / tp_size
     tp_plan: str = "auto"
-    gradient_checkpointing: bool = True  # recompute student activations in backward
 
 
 def main(args: TrainArgs) -> None:
@@ -76,7 +75,6 @@ def main(args: TrainArgs) -> None:
         config = default_codi_config_from_tokenizer(
             tokenizer, latent_steps=args.latent_steps, require_action_next_eot=False
         )
-        config.gradient_checkpointing = args.gradient_checkpointing
 
         load_device_map = args.device_map
 
@@ -105,11 +103,6 @@ def main(args: TrainArgs) -> None:
         if not is_sharded_model:
             model.to(dist_state.device)
         model.train()
-
-        # Gradient checkpointing is intentionally omitted: the step-by-step
-        # KV-cache forward in CodiModel requires use_cache=True. LoRA weights get
-        # gradients without forcing frozen embedding outputs to require grad; the
-        # latter only bloats the long streaming autograd graph.
 
         pad_id = (
             tokenizer.pad_token_id

@@ -21,9 +21,6 @@ class CodiConfig:
     kd_loss: Literal["l1", "smooth_l1", "mse"] = "l1"
     normalize_kd_by_teacher_std: bool = True
     kd_eps: float = 1e-6
-    # Recompute each student call's activations in backward (Option A). Detaches
-    # the KV cache at every call boundary; keeps the latent generation gradient.
-    gradient_checkpointing: bool = False
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
