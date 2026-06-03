@@ -8,16 +8,15 @@ from torch import nn
 
 @dataclass
 class CodiConfig:
-    line_sep_token_id: int
-    sot_token_id: int
-    eot_token_id: int
-    action_sep_token_id: int
+    latent_span_start_token_id: int
+    latent_span_end_token_id: int
     latent_steps: int
+    latent_start_token_id: int | None = None
+    latent_end_token_id: int | None = None
     lm_loss_weight: float = 1.0
     kd_loss_weight: float = 1.0
     ignore_index: int = -100
-    distill_offset: int = 1
-    expected_action_next_token_id: int | None = None
+    distill_offset: int = 0
     kd_loss: Literal["l1", "smooth_l1", "mse"] = "l1"
     normalize_kd_by_teacher_std: bool = True
     kd_eps: float = 1e-6
@@ -62,17 +61,13 @@ def default_codi_config_from_tokenizer(
     tokenizer,
     *,
     latent_steps: int,
-    require_action_next_eot: bool = True,
 ) -> CodiConfig:
     return CodiConfig(
-        line_sep_token_id=cwm_token_id(tokenizer, "<|line_sep|>"),
-        sot_token_id=cwm_token_id(tokenizer, "<|reasoning_thinking_start|>"),
-        eot_token_id=cwm_token_id(tokenizer, "<|reasoning_thinking_end|>"),
-        action_sep_token_id=cwm_token_id(tokenizer, "<|action_sep|>"),
+        latent_span_start_token_id=cwm_token_id(tokenizer, "<|line_sep|>"),
+        latent_span_end_token_id=cwm_token_id(tokenizer, "<|action_sep|>"),
+        latent_start_token_id=cwm_token_id(tokenizer, "<|reasoning_thinking_start|>"),
+        latent_end_token_id=cwm_token_id(tokenizer, "<|reasoning_thinking_end|>"),
         latent_steps=latent_steps,
-        expected_action_next_token_id=cwm_token_id(tokenizer, "<|eot_id|>")
-        if require_action_next_eot
-        else None,
     )
 
 

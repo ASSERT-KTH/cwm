@@ -1,10 +1,3 @@
-import os
-
-# CodiModel always torch.compiles the decoder; keep the suite eager (login/CI
-# nodes have no usable GPU for inductor). Compile correctness is validated on the
-# training cluster.
-os.environ.setdefault("TORCHDYNAMO_DISABLE", "1")
-
 import torch
 from transformers import CwmConfig, CwmForCausalLM
 
@@ -39,12 +32,11 @@ def test_codi_loss_backprops_only_to_student() -> None:
     student = _tiny_model()
 
     config = CodiConfig(
-        line_sep_token_id=10,
-        sot_token_id=11,
-        eot_token_id=12,
-        action_sep_token_id=13,
+        latent_span_start_token_id=10,
+        latent_span_end_token_id=13,
         latent_steps=2,
-        expected_action_next_token_id=9,
+        latent_start_token_id=11,
+        latent_end_token_id=12,
     )
     model = CodiModel(student=student, config=config)
 
@@ -75,14 +67,32 @@ def test_codi_loss_backprops_only_to_student() -> None:
 
 def _codi_model(latent_steps: int = 2) -> tuple[CodiModel, CodiConfig]:
     config = CodiConfig(
-        line_sep_token_id=10,
-        sot_token_id=11,
-        eot_token_id=12,
-        action_sep_token_id=13,
+        latent_span_start_token_id=10,
+        latent_span_end_token_id=13,
         latent_steps=latent_steps,
-        expected_action_next_token_id=9,
+        latent_start_token_id=11,
+        latent_end_token_id=12,
     )
     return CodiModel(student=_tiny_model(), config=config), config
+
+
+def test_latent_span_replaces_inner_text() -> None:
+    torch.manual_seed(0)
+    model, config = _codi_model(latent_steps=2)
+    model.eval()
+
+    input_ids = torch.tensor([[2, 10, 7, 8, 13, 9]])
+    attention_mask = torch.ones_like(input_ids)
+    labels = input_ids.clone()
+    batch_idx, teacher_pos = model._teacher_positions(input_ids, labels, attention_mask)
+
+    _, _, student_pos, _, student_tokens = streaming_student_outputs(
+        model, input_ids, labels, attention_mask, batch_idx, teacher_pos
+    )
+
+    assert teacher_pos.tolist() == [4]
+    assert student_pos.tolist() == [6]
+    assert student_tokens == 8
 
 
 def test_batched_streaming_matches_per_row() -> None:
@@ -90,7 +100,7 @@ def test_batched_streaming_matches_per_row() -> None:
     model, config = _codi_model()
     model.eval()
 
-    # Different lengths / chunk counts, each row carrying one KD target ("13 9").
+    # Different lengths / span counts, each row carrying one KD target (token 13).
     rows = [
         [2, 5, 10, 7, 13, 9, 3, 0, 0, 0],
         [2, 10, 6, 6, 13, 9, 4, 8, 10, 3],
@@ -176,12 +186,11 @@ def test_checkpoint_preserves_latent_gradient() -> None:
     # matches the eager path and grads reach the thought projector.
     torch.manual_seed(0)
     config = CodiConfig(
-        line_sep_token_id=10,
-        sot_token_id=11,
-        eot_token_id=12,
-        action_sep_token_id=13,
+        latent_span_start_token_id=10,
+        latent_span_end_token_id=13,
         latent_steps=2,
-        expected_action_next_token_id=9,
+        latent_start_token_id=11,
+        latent_end_token_id=12,
     )
     model = CodiModel(student=_tiny_model(), config=config, use_thought_projector=True)
     model.eval()
@@ -208,12 +217,11 @@ def test_codi_kd_positions_ignore_masked_prompt_tokens() -> None:
     student = _tiny_model()
 
     config = CodiConfig(
-        line_sep_token_id=10,
-        sot_token_id=11,
-        eot_token_id=12,
-        action_sep_token_id=13,
+        latent_span_start_token_id=10,
+        latent_span_end_token_id=13,
         latent_steps=1,
-        expected_action_next_token_id=9,
+        latent_start_token_id=11,
+        latent_end_token_id=12,
     )
     model = CodiModel(student=student, config=config)
 
@@ -224,4 +232,4 @@ def test_codi_kd_positions_ignore_masked_prompt_tokens() -> None:
 
     output = model(input_ids, labels=labels, attention_mask=attention_mask)
 
-    assert output.kd_positions.tolist() == [[0, 6, 9]]
+    assert output.kd_positions.tolist() == [[0, 5, 7]]

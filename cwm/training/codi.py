@@ -43,25 +43,6 @@ class CodiModel(nn.Module):
             ref = self.input_embeddings.weight
             self.thought_projector.to(device=ref.device, dtype=ref.dtype)
 
-        # The streaming pass is CPU/dispatch-bound: hundreds of sequential
-        # decoder calls, each layer multiplied by the PEFT per-linear wrappers
-        # and nn.Module machinery (~70% of the py-spy profile). Compile each
-        # decoder layer in place rather than the whole stack -- that dispatch
-        # hotspot lives inside one layer, so a single small per-layer graph
-        # (reused across every layer and call) collapses the same Python overhead
-        # while compiling in seconds and tolerating the streaming pass's varying
-        # query width / KV-cache length far better than one giant dynamic graph
-        # over all layers. lm_head and the outer model stay eager; `_call_model`
-        # calls `causal_lm.model` directly and transparently runs the compiled
-        # layers. dynamic=True because both the query width and the KV-cache
-        # length change every call. Always on (the optimal path); set
-        # TORCHDYNAMO_DISABLE=1 to fall back to eager (e.g. tests).
-        causal_lm = self._causal_lm_module()
-        if causal_lm is not None:
-            layers = causal_lm.model.layers
-            for i in range(len(layers)):
-                layers[i] = torch.compile(layers[i], dynamic=True)
-
     @property
     def input_embeddings(self) -> nn.Module:
         return self.student.get_input_embeddings()
@@ -82,18 +63,16 @@ class CodiModel(nn.Module):
         attention_mask: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         cfg = self.config
-        batch_idx, action_pos = (input_ids == cfg.action_sep_token_id).nonzero(
+        batch_idx, end_pos = (input_ids == cfg.latent_span_end_token_id).nonzero(
             as_tuple=True
         )
-        teacher_pos = action_pos + cfg.distill_offset
+        teacher_pos = end_pos + cfg.distill_offset
         valid = teacher_pos < input_ids.shape[1]
         batch_idx = batch_idx[valid]
         teacher_pos = teacher_pos[valid]
 
         valid = attention_mask[batch_idx, teacher_pos].bool()
         valid &= labels[batch_idx, teacher_pos] != cfg.ignore_index
-        if cfg.expected_action_next_token_id is not None:
-            valid &= input_ids[batch_idx, teacher_pos] == cfg.expected_action_next_token_id
         return batch_idx[valid], teacher_pos[valid]
 
     def _hidden_loss(

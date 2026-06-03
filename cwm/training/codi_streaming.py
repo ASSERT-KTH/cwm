@@ -12,36 +12,58 @@ HiddenRequest = Literal["none", "all_layers", "last_layer"]
 
 
 @dataclass(frozen=True)
-class _ChunkSpan:
+class _TextSpan:
     start: int
     end: int
-    has_line_sep: bool
+    insert_latent_after: bool
 
     @property
     def length(self) -> int:
         return self.end - self.start
 
 
-def _chunk_spans(line_sep_id: int, row: list[int], valid_len: int) -> list[_ChunkSpan]:
-    """Split one row into spans, each ending at a <|line_sep|> (or the row end)."""
-    chunks, prev = [], 0
-    for i, tok in enumerate(row[:valid_len]):
-        if tok == line_sep_id:
-            chunks.append(_ChunkSpan(prev, i + 1, True))
-            prev = i + 1
-    if prev < valid_len:
-        chunks.append(_ChunkSpan(prev, valid_len, False))
-    return chunks
+def _student_spans(
+    start_token_id: int,
+    end_token_id: int,
+    row: list[int],
+    valid_len: int,
+) -> list[_TextSpan]:
+    """Visible student spans, replacing start/end-exclusive text with latents."""
+    spans: list[_TextSpan] = []
+    prev = 0
+    while prev < valid_len:
+        start = next(
+            (i for i in range(prev, valid_len) if row[i] == start_token_id),
+            None,
+        )
+        if start is None:
+            spans.append(_TextSpan(prev, valid_len, False))
+            break
+
+        end = next(
+            (i for i in range(start + 1, valid_len) if row[i] == end_token_id),
+            None,
+        )
+        if end is None:
+            spans.append(_TextSpan(prev, valid_len, False))
+            break
+
+        spans.append(_TextSpan(prev, start + 1, True))
+        prev = end
+
+    return spans
 
 
 class _StreamingStudent:
     """One teacher-forced streaming pass over a batch of CRUXEval traces.
 
-    Text chunks (split at ``<|line_sep|>``) and the injected latent tokens are
-    fed to the LoRA student incrementally through a KV cache: LM loss is summed
-    per token and student hidden states are collected at the KD (teacher)
-    positions. The latent embedding at each step is produced from the previous
-    step's last hidden state, so the pass is inherently sequential.
+    The student keeps each configured span boundary token visible, but replaces
+    the text between the start/end tokens with injected latent tokens. Visible
+    text spans and latents are fed incrementally through a KV cache: LM loss is
+    summed per visible token and student hidden states are collected at KD
+    positions that still exist in the visible student sequence. The latent
+    embedding at each step is produced from the previous step's last hidden
+    state, so the pass is inherently sequential.
 
     Whenever grad is enabled every student call recomputes its activations
     during backward instead of storing them, which removes the dominant memory
@@ -73,14 +95,27 @@ class _StreamingStudent:
         self.batch_size = input_ids.shape[0]
         self._pos_dtype = batch_idx.dtype
 
-        self.sot_embed = self._token_embed(self.cfg.sot_token_id)
-        self.eot_embed = self._token_embed(self.cfg.eot_token_id)
+        self.latent_start_embed = (
+            self._token_embed(self.cfg.latent_start_token_id)
+            if self.cfg.latent_start_token_id is not None
+            else None
+        )
+        self.latent_end_embed = (
+            self._token_embed(self.cfg.latent_end_token_id)
+            if self.cfg.latent_end_token_id is not None
+            else None
+        )
         self.ignore_lab = labels.new_full((1,), self.cfg.ignore_index)
 
         rows = input_ids.tolist()
         valid_lens = attention_mask.sum(dim=1).tolist()
-        self.chunks_by_row = [
-            _chunk_spans(self.cfg.line_sep_token_id, rows[b], valid_lens[b])
+        self.spans_by_row = [
+            _student_spans(
+                self.cfg.latent_span_start_token_id,
+                self.cfg.latent_span_end_token_id,
+                rows[b],
+                valid_lens[b],
+            )
             for b in range(self.batch_size)
         ]
         self.targets_by_row = [
@@ -132,9 +167,8 @@ class _StreamingStudent:
         )
         causal_lm = self.model._causal_lm_module()
         if causal_lm is not None:
-            # Unified path so every call hits the decoder (whose layers are
-            # compiled in place by CodiModel). lm_head stays eager; the full
-            # hidden-state tuple is requested only for KD.
+            # Call the decoder directly so lm_head can be skipped when logits are
+            # not needed; the full hidden-state tuple is requested only for KD.
             want_hidden = hidden_request == "all_layers"
             out = causal_lm.model(**kw, output_hidden_states=want_hidden)
             last_hidden = out.last_hidden_state if hidden_request == "last_layer" else None
@@ -243,13 +277,13 @@ class _StreamingStudent:
         )
         self.lm_count += (labels != self.cfg.ignore_index).sum()
 
-    def _kd_offsets(self, row: int, span: _ChunkSpan) -> list[int]:
+    def _kd_offsets(self, row: int, span: _TextSpan) -> list[int]:
         offsets: list[int] = []
         targets = self.targets_by_row[row]
+        while self.target_ptr[row] < len(targets) and targets[self.target_ptr[row]] < span.start:
+            self.target_ptr[row] += 1
         while self.target_ptr[row] < len(targets) and targets[self.target_ptr[row]] < span.end:
-            target = targets[self.target_ptr[row]]
-            if target >= span.start:
-                offsets.append(target - span.start)
+            offsets.append(targets[self.target_ptr[row]] - span.start)
             self.target_ptr[row] += 1
         return offsets
 
@@ -263,18 +297,22 @@ class _StreamingStudent:
             layer_kd.extend(hidden[row, idx])
         self.kd_pos_by_row[row].extend(start_pos + off for off in offsets)
 
-    # -- chunk / latent steps -----------------------------------------------
+    # -- span / latent steps ------------------------------------------------
 
-    def _needs_hidden(self, spans: list[_ChunkSpan | None]) -> bool:
-        return any(
-            span is not None
-            and self.target_ptr[b] < len(self.targets_by_row[b])
-            and self.targets_by_row[b][self.target_ptr[b]] < span.end
-            for b, span in enumerate(spans)
-        )
+    def _needs_hidden(self, spans: list[_TextSpan | None]) -> bool:
+        for b, span in enumerate(spans):
+            if span is None:
+                continue
+            targets = self.targets_by_row[b]
+            ptr = self.target_ptr[b]
+            while ptr < len(targets) and targets[ptr] < span.start:
+                ptr += 1
+            if ptr < len(targets) and targets[ptr] < span.end:
+                return True
+        return False
 
-    def _chunk_inputs(
-        self, spans: list[_ChunkSpan | None], width: int
+    def _span_inputs(
+        self, spans: list[_TextSpan | None], width: int
     ) -> tuple[torch.Tensor, torch.Tensor]:
         step_embeds = self.embed.weight.new_zeros(self.batch_size, width, self.hidden)
         step_mask = torch.zeros(self.batch_size, width, device=self.device, dtype=torch.long)
@@ -285,8 +323,8 @@ class _StreamingStudent:
             step_mask[b, : span.length] = 1
         return step_embeds, step_mask
 
-    def _consume_chunk(
-        self, spans: list[_ChunkSpan | None], logits: torch.Tensor, hidden_states: tuple | None
+    def _consume_spans(
+        self, spans: list[_TextSpan | None], logits: torch.Tensor, hidden_states: tuple | None
     ) -> None:
         for b, span in enumerate(spans):
             if span is None:
@@ -327,8 +365,15 @@ class _StreamingStudent:
         self.tokens += len(rows)
         return last_hidden
 
+    def _latent_call_count(self) -> int:
+        return (
+            int(self.latent_start_embed is not None)
+            + self.cfg.latent_steps
+            + int(self.latent_end_embed is not None)
+        )
+
     def _latent_block(self, rows: list[int]) -> None:
-        if not rows:
+        if not rows or self._latent_call_count() == 0:
             return
         row_idx = torch.tensor(rows, device=self.device)
         if torch.is_grad_enabled():
@@ -336,26 +381,51 @@ class _StreamingStudent:
         else:
             self._latent_block_plain(rows, row_idx)
 
+    def _empty_latent_base(self, row_idx: torch.Tensor) -> torch.Tensor:
+        return self.embed.weight.new_zeros(row_idx.shape[0], self.hidden)
+
+    def _latent_input_from_base(
+        self, base: torch.Tensor, row_idx: torch.Tensor
+    ) -> torch.Tensor:
+        latent = base
+        if self.model.thought_projector is not None:
+            latent = self.model.thought_projector(
+                base.to(device=self.proj_device, dtype=self.proj_dtype)
+            )
+        latent_in = self.embed.weight.new_zeros(self.batch_size, 1, self.hidden)
+        latent_in[row_idx, 0] = latent.to(device=self.device, dtype=latent_in.dtype)
+        return latent_in
+
     def _latent_block_plain(self, rows: list[int], row_idx: torch.Tensor) -> None:
-        step_embeds = self.embed.weight.new_zeros(self.batch_size, 1, self.hidden)
-        step_embeds[row_idx, 0] = self.sot_embed
-        last_hidden = self._latent_step(step_embeds, rows, "last_layer", compute_logits=False)
-        base = last_hidden[row_idx, 0]
+        base = self._empty_latent_base(row_idx)
+        if self.latent_start_embed is not None:
+            is_final = self.cfg.latent_steps == 0 and self.latent_end_embed is None
+            step_embeds = self.embed.weight.new_zeros(self.batch_size, 1, self.hidden)
+            step_embeds[row_idx, 0] = self.latent_start_embed
+            last_hidden = self._latent_step(
+                step_embeds,
+                rows,
+                "none" if is_final else "last_layer",
+                compute_logits=is_final,
+            )
+            if last_hidden is not None:
+                base = last_hidden[row_idx, 0]
 
-        for _ in range(self.cfg.latent_steps):
-            latent = base
-            if self.model.thought_projector is not None:
-                latent = self.model.thought_projector(
-                    base.to(device=self.proj_device, dtype=self.proj_dtype)
-                )
-            latent_in = self.embed.weight.new_zeros(self.batch_size, 1, self.hidden)
-            latent_in[row_idx, 0] = latent.to(device=self.device, dtype=latent_in.dtype)
-            last_hidden = self._latent_step(latent_in, rows, "last_layer", compute_logits=False)
-            base = last_hidden[row_idx, 0]
+        for i in range(self.cfg.latent_steps):
+            is_final = i + 1 == self.cfg.latent_steps and self.latent_end_embed is None
+            last_hidden = self._latent_step(
+                self._latent_input_from_base(base, row_idx),
+                rows,
+                "none" if is_final else "last_layer",
+                compute_logits=is_final,
+            )
+            if last_hidden is not None:
+                base = last_hidden[row_idx, 0]
 
-        step_embeds = self.embed.weight.new_zeros(self.batch_size, 1, self.hidden)
-        step_embeds[row_idx, 0] = self.eot_embed
-        self._latent_step(step_embeds, rows, "none", compute_logits=True)
+        if self.latent_end_embed is not None:
+            step_embeds = self.embed.weight.new_zeros(self.batch_size, 1, self.hidden)
+            step_embeds[row_idx, 0] = self.latent_end_embed
+            self._latent_step(step_embeds, rows, "none", compute_logits=True)
 
     def _latent_block_forward(
         self,
@@ -363,16 +433,17 @@ class _StreamingStudent:
         prefix_mask: torch.Tensor,
         base_pos: torch.Tensor,
         step_mask: torch.Tensor,
-        sot_embeds: torch.Tensor,
-        eot_embeds: torch.Tensor,
+        latent_start_embeds: torch.Tensor,
+        latent_end_embeds: torch.Tensor,
         row_idx: torch.Tensor,
     ):
-        """Checkpointable: runs the whole latent block (sot + latent_steps + eot)
-        as one recompute unit. Rebuilds the cache once from the earlier chunks,
-        then grows it in place across the single-token internal calls, applying the
-        thought projector between them. Returns the eot logits (for the next chunk's
-        first-token LM handoff) and the flat new key/value tail of every internal
-        call (one per token) to extend the chunk list with."""
+        """Checkpointable latent replacement block.
+
+        Rebuilds the cache once from the earlier key/value chunks, then grows it
+        across the optional latent-start token, latent states, and optional
+        latent-end token. The final inserted token returns logits for the next
+        visible span's first-token LM handoff.
+        """
         if chunks:
             num_layers = len(chunks[0]) // 2
             pairs = [
@@ -404,56 +475,66 @@ class _StreamingStudent:
                 tails.append(layer.values[:, :, -1:, :].contiguous())
             return logits, last_hidden
 
-        _, last_hidden = one_call(sot_embeds, "last_layer", False)
-        base = last_hidden[row_idx, 0]
-        for _ in range(self.cfg.latent_steps):
-            latent = base
-            if self.model.thought_projector is not None:
-                latent = self.model.thought_projector(
-                    base.to(device=self.proj_device, dtype=self.proj_dtype)
-                )
-            latent_in = self.embed.weight.new_zeros(self.batch_size, 1, self.hidden)
-            latent_in[row_idx, 0] = latent.to(device=self.device, dtype=latent_in.dtype)
-            _, last_hidden = one_call(latent_in, "last_layer", False)
-            base = last_hidden[row_idx, 0]
-        eot_logits, _ = one_call(eot_embeds, "none", True)
+        final_logits = None
+        base = self._empty_latent_base(row_idx)
+        if self.latent_start_embed is not None:
+            is_final = self.cfg.latent_steps == 0 and self.latent_end_embed is None
+            final_logits, last_hidden = one_call(
+                latent_start_embeds,
+                "none" if is_final else "last_layer",
+                is_final,
+            )
+            if last_hidden is not None:
+                base = last_hidden[row_idx, 0]
 
-        return eot_logits, tuple(tails)
+        for i in range(self.cfg.latent_steps):
+            is_final = i + 1 == self.cfg.latent_steps and self.latent_end_embed is None
+            final_logits, last_hidden = one_call(
+                self._latent_input_from_base(base, row_idx),
+                "none" if is_final else "last_layer",
+                is_final,
+            )
+            if last_hidden is not None:
+                base = last_hidden[row_idx, 0]
+
+        if self.latent_end_embed is not None:
+            final_logits, _ = one_call(latent_end_embeds, "none", True)
+
+        return final_logits, tuple(tails)
 
     def _latent_block_checkpointed(self, rows: list[int], row_idx: torch.Tensor) -> None:
         step_mask = torch.zeros(self.batch_size, 1, device=self.device, dtype=torch.long)
         step_mask[row_idx, 0] = 1
         base_pos = torch.tensor(self.logical_pos, device=self.device)
-        sot_embeds = self.embed.weight.new_zeros(self.batch_size, 1, self.hidden)
-        sot_embeds[row_idx, 0] = self.sot_embed
-        eot_embeds = self.embed.weight.new_zeros(self.batch_size, 1, self.hidden)
-        eot_embeds[row_idx, 0] = self.eot_embed
+        latent_start_embeds = self.embed.weight.new_zeros(self.batch_size, 1, self.hidden)
+        if self.latent_start_embed is not None:
+            latent_start_embeds[row_idx, 0] = self.latent_start_embed
+        latent_end_embeds = self.embed.weight.new_zeros(self.batch_size, 1, self.hidden)
+        if self.latent_end_embed is not None:
+            latent_end_embeds[row_idx, 0] = self.latent_end_embed
 
-        eot_logits, tails = checkpoint(
+        final_logits, tails = checkpoint(
             self._latent_block_forward,
             tuple(self._kv_chunks),
             self.cache_mask,
             base_pos,
             step_mask,
-            sot_embeds,
-            eot_embeds,
+            latent_start_embeds,
+            latent_end_embeds,
             row_idx,
             use_reentrant=False,
         )
 
-        # Split the flat tail back into one (k0, v0, k1, v1, ...) tuple per call.
-        num_calls = self.cfg.latent_steps + 2
+        num_calls = self._latent_call_count()
         per = len(tails) // num_calls
         for c in range(num_calls):
             self._kv_chunks.append(tails[c * per : (c + 1) * per])
         self.cache_mask = torch.cat([self.cache_mask, step_mask.repeat(1, num_calls)], dim=1)
 
-        # Only live effect of the block: hand the eot logits to the next chunk's
-        # first-token LM term (the per-step ignore-label adds are no-ops).
         for b in rows:
             if self.prev_logits[b] is not None:
                 self._add_lm(self.prev_logits[b][None], self.ignore_lab)
-            self.prev_logits[b] = eot_logits[b, 0]
+            self.prev_logits[b] = final_logits[b, 0]
             self.logical_pos[b] += num_calls
         self.calls += num_calls
         self.tokens += len(rows) * num_calls
@@ -461,21 +542,21 @@ class _StreamingStudent:
     # -- driver --------------------------------------------------------------
 
     def run(self) -> tuple[torch.Tensor, list[torch.Tensor] | None, torch.Tensor, int, int]:
-        max_chunks = max((len(c) for c in self.chunks_by_row), default=0)
-        for chunk_idx in range(max_chunks):
-            spans = [c[chunk_idx] if chunk_idx < len(c) else None for c in self.chunks_by_row]
+        max_spans = max((len(c) for c in self.spans_by_row), default=0)
+        for chunk_idx in range(max_spans):
+            spans = [c[chunk_idx] if chunk_idx < len(c) else None for c in self.spans_by_row]
             width = max((0 if s is None else s.length for s in spans), default=0)
             if width == 0:
                 break
 
-            step_embeds, step_mask = self._chunk_inputs(spans, width)
+            step_embeds, step_mask = self._span_inputs(spans, width)
             hidden_request: HiddenRequest = "all_layers" if self._needs_hidden(spans) else "none"
             logits, _, hidden_states = self._student_step(step_embeds, step_mask, hidden_request)
             self.tokens += sum(s.length for s in spans if s is not None)
-            self._consume_chunk(spans, logits, hidden_states)
+            self._consume_spans(spans, logits, hidden_states)
 
             latent_rows = [
-                b for b, s in enumerate(spans) if s is not None and s.has_line_sep
+                b for b, s in enumerate(spans) if s is not None and s.insert_latent_after
             ]
             self._latent_block(latent_rows)
 

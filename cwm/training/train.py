@@ -70,10 +70,8 @@ def main(args: TrainArgs) -> None:
         torch.manual_seed(args.seed + dist_state.dp_rank)
         tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
 
-        # Trace format: the token after <|action_sep|> is source (not <|eot_id|>),
-        # so KD positions must not require an eot next token.
         config = default_codi_config_from_tokenizer(
-            tokenizer, latent_steps=args.latent_steps, require_action_next_eot=False
+            tokenizer, latent_steps=args.latent_steps
         )
 
         load_device_map = args.device_map
