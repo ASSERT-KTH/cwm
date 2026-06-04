@@ -3,6 +3,7 @@ from transformers import CwmConfig, CwmForCausalLM
 
 from cwm.training.codi import CodiModel
 from cwm.training.codi_config import CodiConfig
+from cwm.training.data import MegabatchSortishSampler
 from cwm.training.codi_streaming import streaming_student_outputs
 
 
@@ -86,7 +87,7 @@ def test_latent_span_replaces_inner_text() -> None:
     labels = input_ids.clone()
     batch_idx, teacher_pos = model._teacher_positions(input_ids, labels, attention_mask)
 
-    _, _, student_pos, _, student_tokens = streaming_student_outputs(
+    _, _, _, student_pos, _, student_tokens = streaming_student_outputs(
         model, input_ids, labels, attention_mask, batch_idx, teacher_pos
     )
 
@@ -111,7 +112,7 @@ def test_batched_streaming_matches_per_row() -> None:
     labels = input_ids.masked_fill(~attention_mask.bool(), config.ignore_index)
 
     batch_idx, teacher_pos = model._teacher_positions(input_ids, labels, attention_mask)
-    _, kd_batched, spos_batched, _, _ = streaming_student_outputs(
+    _, _, kd_batched, spos_batched, _, _ = streaming_student_outputs(
         model, input_ids, labels, attention_mask, batch_idx, teacher_pos
     )
 
@@ -122,7 +123,7 @@ def test_batched_streaming_matches_per_row() -> None:
         ids, am = input_ids[b : b + 1], attention_mask[b : b + 1]
         lab = labels[b : b + 1]
         bi, tp = model._teacher_positions(ids, lab, am)
-        _, kd_row, spos_row, _, _ = streaming_student_outputs(
+        _, _, kd_row, spos_row, _, _ = streaming_student_outputs(
             model, ids, lab, am, bi, tp
         )
         if ref_layers is None:
@@ -228,7 +229,7 @@ def test_kd_layers_subset_restricts_distilled_layers() -> None:
     attention_mask = torch.ones_like(input_ids)
     labels = input_ids.clone()
 
-    _, kd, _, _, _ = streaming_student_outputs(
+    _, _, kd, _, _, _ = streaming_student_outputs(
         model, input_ids, labels, attention_mask, *model._teacher_positions(input_ids, labels, attention_mask)
     )
     assert len(kd) == 1  # _tiny_model has 2 layers; only the last is distilled
@@ -257,3 +258,39 @@ def test_codi_kd_positions_ignore_masked_prompt_tokens() -> None:
     output = model(input_ids, labels=labels, attention_mask=attention_mask)
 
     assert output.kd_positions.tolist() == [[0, 5, 7]]
+
+
+def test_token_budget_sampler_allows_variable_rows_across_dp_ranks() -> None:
+    lengths = [10, 10, 10, 10, 100, 100, 100, 100]
+    samplers = [
+        MegabatchSortishSampler(
+            lengths,
+            batch_size=4,
+            megabatch_mult=2,
+            max_batch_tokens=200,
+            num_replicas=4,
+            rank=rank,
+            shuffle=False,
+        )
+        for rank in range(4)
+    ]
+
+    batches_by_rank = [list(sampler) for sampler in samplers]
+    assert [len(batches) for batches in batches_by_rank] == [1, 1, 1, 1]
+    assert [len(batches[0]) for batches in batches_by_rank] == [2, 2, 4, 2]
+
+
+def test_token_budget_sampler_len_tracks_current_epoch() -> None:
+    lengths = [100, 100, 100, 100, 10, 10, 10, 10, 70, 70, 20, 20]
+    sampler = MegabatchSortishSampler(
+        lengths,
+        batch_size=4,
+        megabatch_mult=2,
+        max_batch_tokens=200,
+        shuffle=True,
+        seed=2,
+    )
+
+    assert len(sampler) == 5
+    sampler.set_epoch(4)
+    assert len(sampler) == 6

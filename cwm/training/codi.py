@@ -2,6 +2,7 @@
 
 from dataclasses import dataclass
 import torch
+import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
@@ -25,10 +26,12 @@ class CodiModel(nn.Module):
         student: nn.Module,
         config: CodiConfig,
         use_thought_projector: bool = False,
+        dp_group=None,
     ) -> None:
         super().__init__()
         self.student = apply_lora(student, config)
         self.config = config
+        self.dp_group = dp_group  # DP process group for exact token-weighted loss
 
         self.thought_projector = None
         if use_thought_projector:
@@ -46,15 +49,6 @@ class CodiModel(nn.Module):
     @property
     def input_embeddings(self) -> nn.Module:
         return self.student.get_input_embeddings()
-
-    def _causal_lm_module(self) -> nn.Module | None:
-        base_model = getattr(self.student, "base_model", None)
-        causal_lm = getattr(base_model, "model", None)
-        if causal_lm is None:
-            causal_lm = self.student
-        if hasattr(causal_lm, "model") and hasattr(causal_lm, "lm_head"):
-            return causal_lm
-        return None
 
     def _teacher_positions(
         self,
@@ -111,6 +105,16 @@ class CodiModel(nn.Module):
         ]
         return torch.stack(losses).mean()
 
+    def _dp_loss_weights(self, lm_count: torch.Tensor, kd_count: int):
+        """Per-rank loss scale = local_count / global_count, so all-reduce-SUM
+        of grads yields the exact global token/position mean. 1.0 outside DP."""
+        if self.dp_group is None:
+            return 1.0, 1.0
+        local = torch.stack([lm_count, lm_count.new_tensor(kd_count)]).float()
+        total = local.clone()
+        dist.all_reduce(total, op=dist.ReduceOp.SUM, group=self.dp_group)
+        return (local / total.clamp(min=1)).unbind()
+
     def _teacher_kd_vecs(
         self,
         input_ids: torch.Tensor,
@@ -130,11 +134,9 @@ class CodiModel(nn.Module):
                 continue
             valid_len = int(attention_mask[b].sum().item())
             row_ids = input_ids[b : b + 1, :valid_len]
-            # Decoder-only forward (skips lm_head); fall back to the full student
-            # for architectures without a separate decoder/lm_head split.
-            causal_lm = self._causal_lm_module()
-            module = causal_lm.model if causal_lm is not None else self.student
-            out = module(input_ids=row_ids, output_hidden_states=True, use_cache=False)
+            # Decoder-only forward (skips lm_head).
+            causal_lm = self.student.base_model.model  # CwmForCausalLM
+            out = causal_lm.model(input_ids=row_ids, output_hidden_states=True, use_cache=False)
             layers = select_kd_layers(out.hidden_states, self.config.kd_layers)
             if teacher_kd is None:
                 teacher_kd = [[] for _ in layers]
@@ -147,24 +149,17 @@ class CodiModel(nn.Module):
         self,
         input_ids: torch.Tensor,
         *,
-        labels: torch.Tensor | None = None,
-        attention_mask: torch.Tensor | None = None,
+        labels: torch.Tensor,
+        attention_mask: torch.Tensor,
     ) -> CodiOutput:
-        if attention_mask is None:
-            attention_mask = torch.ones_like(input_ids)
-        if labels is None:
-            labels = input_ids.masked_fill(
-                ~attention_mask.bool(),
-                self.config.ignore_index,
-            )
-
         batch_idx, teacher_pos = self._teacher_positions(
             input_ids,
             labels,
             attention_mask,
         )
         (
-            lm_loss,
+            lm_sum,
+            lm_count,
             student_kd_vecs,
             student_pos,
             student_model_calls,
@@ -197,11 +192,16 @@ class CodiModel(nn.Module):
             finally:
                 self.student.train(was_training)
 
+        lm_loss = lm_sum / lm_count.clamp(min=1)
         kd_loss = self._kd_loss(student_kd_vecs, teacher_kd_vecs, lm_loss)
-        loss = self.config.lm_loss_weight * lm_loss + self.config.kd_loss_weight * kd_loss
+        true_loss = self.config.lm_loss_weight * lm_loss + self.config.kd_loss_weight * kd_loss
+        # Backward on a token/position-weighted loss (pairs with all-reduce-SUM
+        # grads); true_loss is the unweighted value for logging.
+        lm_w, kd_w = self._dp_loss_weights(lm_count, batch_idx.numel())
+        loss = self.config.lm_loss_weight * lm_loss * lm_w + self.config.kd_loss_weight * kd_loss * kd_w
         kd_positions = torch.stack((batch_idx, teacher_pos, student_pos), dim=1)
         metrics = {
-            "loss": loss.detach(),
+            "loss": true_loss.detach(),
             "lm_loss": lm_loss.detach(),
             "kd_loss": kd_loss.detach(),
             "num_kd_positions": torch.tensor(

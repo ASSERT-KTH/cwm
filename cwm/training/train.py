@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import sys
 import time
 from dataclasses import dataclass
 from pathlib import Path
@@ -31,6 +32,8 @@ from cwm.training.distributed import (
     init_distributed,
     sync_gradients,
 )
+import bitsandbytes
+
 
 logger = logging.getLogger(__name__)
 
@@ -42,20 +45,21 @@ class TrainArgs:
     latent_steps: int = 2
     kd_layers: list[int] | None = None  # None = all layers; e.g. [-1] for last only
     use_thought_projector: bool = True
+    qlora: bool = False  # load base in 4-bit NF4 (bitsandbytes); teacher runs on the quantized base
     lr: float = 1e-4
     epochs: int = 1
     batch_size: int = 1
-    grad_accum_steps: int = 32
+    grad_accum_steps: int = 1
     max_grad_norm: float = 1.0
     save_every_steps: int = 0  # 0 = save only at end
     n_samples: int = -1
     max_seq_len: int = 8192
+    megabatch_mult: int = 8  # length-bucketing strength; larger packs tighter (less padding) but more difficulty-homogeneous batches
+    max_batch_tokens: int = 0  # 0 = fixed batch_size; >0 = padded-token budget per batch
     seed: int = 42
     wandb_log: bool = False
     wandb_name: str = ""
-    wandb_log_every: int = 1
     timing_log_every: int = 0  # 0 = disabled; log rank0 timing every N optimizer steps
-    device_map: str = "auto"
     num_workers: int = 16
     flash_attn: bool = True   # sdpa fused-kernel attention (no extra package needed)
     tp_size: int = 1
@@ -63,8 +67,24 @@ class TrainArgs:
     tp_plan: str = "auto"
 
 
+def _wandb_name(args: TrainArgs, dist_state) -> str:
+    if args.wandb_name:
+        return args.wandb_name
+    kd = "all" if args.kd_layers is None else "-".join(map(str, args.kd_layers))
+    return (
+        f"codi_{'qlora' if args.qlora else 'full'}_lat{args.latent_steps}_kd{kd}"
+        f"_bs{args.batch_size}x{args.grad_accum_steps}_lr{args.lr:g}"
+        f"_seq{args.max_seq_len}_mbt{args.max_batch_tokens}"
+        f"_ep{args.epochs}_dp{dist_state.dp_size}_tp{dist_state.tp_size}"
+        f"_proj{int(args.use_thought_projector)}_seed{args.seed}"
+    )
+
+
 def main(args: TrainArgs) -> None:
     from transformers import AutoModelForCausalLM, AutoTokenizer
+
+    if args.qlora and args.tp_size > 1:
+        raise ValueError("qlora (bitsandbytes 4-bit) is incompatible with tp_size > 1")
 
     dist_state = init_distributed(tp_size=args.tp_size, dp_size=args.dp_size)
     try:
@@ -77,30 +97,34 @@ def main(args: TrainArgs) -> None:
             kd_layers=tuple(args.kd_layers) if args.kd_layers else None,
         )
 
-        load_device_map = args.device_map
+        kwargs: dict = {"dtype": torch.bfloat16}
+        if args.flash_attn:
+            kwargs["attn_implementation"] = "sdpa"
+        if args.qlora:
+            from transformers import BitsAndBytesConfig
 
-        def load():
-            kwargs: dict = {"dtype": torch.bfloat16}
-            if args.flash_attn:
-                kwargs["attn_implementation"] = "sdpa"
-            if dist_state.tp_enabled:
-                if args.tp_plan in (None, "none", "None"):
-                    raise ValueError("tp_size > 1 requires tp_plan, usually tp_plan=auto")
-                kwargs["tp_plan"] = args.tp_plan
-                kwargs["device_mesh"] = dist_state.device_mesh
-            elif load_device_map not in (None, "none", "None"):
-                kwargs["device_map"] = load_device_map
-            return AutoModelForCausalLM.from_pretrained(
-                args.model_name_or_path, **kwargs
+            # 4-bit weights can't be moved with .to(); load straight onto this rank's GPU.
+            kwargs["device_map"] = {"": dist_state.local_rank}
+            kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_compute_dtype=torch.bfloat16,
             )
+        if dist_state.tp_enabled:
+            if args.tp_plan in (None, "none", "None"):
+                raise ValueError("tp_size > 1 requires tp_plan, usually tp_plan=auto")
+            kwargs["tp_plan"] = args.tp_plan
+            kwargs["device_mesh"] = dist_state.device_mesh
 
-        student = load()
+        student = AutoModelForCausalLM.from_pretrained(args.model_name_or_path, **kwargs)
         model = CodiModel(
             student=student,
             config=config,
             use_thought_projector=args.use_thought_projector,
+            dp_group=dist_state.dp_group if dist_state.dp_enabled else None,
         )
-        is_sharded_model = dist_state.tp_enabled or load_device_map not in (None, "none", "None")
+        is_sharded_model = dist_state.tp_enabled or args.qlora
         if not is_sharded_model:
             model.to(dist_state.device)
         model.train()
@@ -121,6 +145,8 @@ def main(args: TrainArgs) -> None:
             batch_size=args.batch_size,
             num_workers=args.num_workers,
             seed=args.seed,
+            megabatch_mult=args.megabatch_mult,
+            max_batch_tokens=args.max_batch_tokens,
         )
         if args.grad_accum_steps <= 0:
             raise ValueError("grad_accum_steps must be positive")
@@ -139,7 +165,8 @@ def main(args: TrainArgs) -> None:
             len(loader),
             sum(p.numel() for p in params),
         )
-        optimizer = torch.optim.AdamW(params, lr=args.lr)
+
+        optimizer = bitsandbytes.optim.AdamW8bit(params, lr=args.lr, weight_decay=0.01)
 
         use_wandb = args.wandb_log and dist_state.is_rank_zero
         if use_wandb:
@@ -149,7 +176,7 @@ def main(args: TrainArgs) -> None:
 
             wandb.init(
                 project="codi_distill_cwm",
-                name=args.wandb_name or None,
+                name=_wandb_name(args, dist_state),
                 config=vars(args),
             )
 
@@ -242,7 +269,7 @@ def main(args: TrainArgs) -> None:
                     kd_pos,
                     float(grad_norm),
                 )
-                if use_wandb and step % args.wandb_log_every == 0:
+                if use_wandb:
                     wandb.log(
                         {
                             "loss": loss,
@@ -323,7 +350,7 @@ def main(args: TrainArgs) -> None:
                 timing["backward"] += timing_stamp() - start
 
                 accum_batches += 1
-                window["loss"] += out.loss.item()
+                window["loss"] += out.metrics["loss"].item()
                 window["lm"] += out.lm_loss.item()
                 window["kd"] += out.kd_loss.item()
                 window["kd_pos"] += out.metrics["num_kd_positions"].item()
@@ -334,6 +361,8 @@ def main(args: TrainArgs) -> None:
                     window = new_window()
                     timing = new_timing()
 
+        save_checkpoint(out_dir)  # final adapter (save_every_steps=0 saves only here)
+
         if torch.cuda.is_available():
             peak_alloc = torch.cuda.max_memory_allocated(dist_state.device) / 1024**3
             peak_reserved = torch.cuda.max_memory_reserved(dist_state.device) / 1024**3
@@ -342,7 +371,21 @@ def main(args: TrainArgs) -> None:
                 dist_state.rank, dist_state.world_size, peak_alloc, peak_reserved,
             )
 
-    finally:
+    except BaseException:
+        logger.exception(
+            "rank %d/%d failed; exiting without graceful distributed cleanup",
+            dist_state.rank,
+            dist_state.world_size,
+        )
+        sys.stdout.flush()
+        sys.stderr.flush()
+        if dist_state.enabled:
+            # If one rank hits OOM/CUDA failure, destroy_process_group() can hang
+            # while other ranks are still computing. Let torchrun observe the
+            # failed child and terminate the rest of the worker group.
+            os._exit(1)
+        raise
+    else:
         destroy_distributed(dist_state)
 
 

@@ -88,10 +88,16 @@ def default_codi_config_from_tokenizer(
 
 
 def apply_lora(student: nn.Module, config: CodiConfig) -> nn.Module:
-    if hasattr(student, "peft_config"):
-        return student
-
     from peft import LoraConfig, TaskType, get_peft_model
+
+    if getattr(student, "is_loaded_in_4bit", False):
+        # QLoRA. HF checkpointing OFF: codi_streaming checkpoints itself and needs
+        # use_cache=True, which gradient_checkpointing_enable() would force off.
+        from peft import prepare_model_for_kbit_training
+
+        student = prepare_model_for_kbit_training(
+            student, use_gradient_checkpointing=False
+        )
 
     lora_config = LoraConfig(
         task_type=TaskType.CAUSAL_LM,

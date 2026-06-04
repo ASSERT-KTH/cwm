@@ -167,27 +167,14 @@ class _StreamingStudent:
             past_key_values=cache,
             use_cache=True,
         )
-        causal_lm = self.model._causal_lm_module()
-        if causal_lm is not None:
-            # Call the decoder directly so lm_head can be skipped when logits are
-            # not needed; the full hidden-state tuple is requested only for KD.
-            want_hidden = hidden_request == "all_layers"
-            out = causal_lm.model(**kw, output_hidden_states=want_hidden)
-            last_hidden = out.last_hidden_state if hidden_request == "last_layer" else None
-            hidden_states = out.hidden_states if want_hidden else None
-            logits = causal_lm.lm_head(out.last_hidden_state) if compute_logits else None
-            return logits, last_hidden, hidden_states, out.past_key_values
-
-        # Fallback for models without a separate decoder/lm_head split (tests use
-        # the causal_lm path above; this keeps the contract for odd architectures).
-        out = self.model.student(**kw, output_hidden_states=hidden_request != "none")
-        logits = out.logits if compute_logits else None
-        last_hidden = (
-            out.hidden_states[-1]
-            if hidden_request == "last_layer" and out.hidden_states is not None
-            else None
-        )
-        hidden_states = out.hidden_states if hidden_request == "all_layers" else None
+        # Call the decoder directly so lm_head can be skipped when logits are not
+        # needed; the full hidden-state tuple is requested only for KD.
+        causal_lm = self.model.student.base_model.model  # CwmForCausalLM
+        want_hidden = hidden_request == "all_layers"
+        out = causal_lm.model(**kw, output_hidden_states=want_hidden)
+        last_hidden = out.last_hidden_state if hidden_request == "last_layer" else None
+        hidden_states = out.hidden_states if want_hidden else None
+        logits = causal_lm.lm_head(out.last_hidden_state) if compute_logits else None
         return logits, last_hidden, hidden_states, out.past_key_values
 
     def _forward_rebuild(
@@ -544,7 +531,7 @@ class _StreamingStudent:
 
     # -- driver --------------------------------------------------------------
 
-    def run(self) -> tuple[torch.Tensor, list[torch.Tensor] | None, torch.Tensor, int, int]:
+    def run(self) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor] | None, torch.Tensor, int, int]:
         max_spans = max((len(c) for c in self.spans_by_row), default=0)
         for chunk_idx in range(max_spans):
             spans = [c[chunk_idx] if chunk_idx < len(c) else None for c in self.spans_by_row]
@@ -565,7 +552,7 @@ class _StreamingStudent:
 
         return self._finalize()
 
-    def _finalize(self) -> tuple[torch.Tensor, list[torch.Tensor] | None, torch.Tensor, int, int]:
+    def _finalize(self) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor] | None, torch.Tensor, int, int]:
         if any(k is not None for k in self.kd_by_row):
             num_layers = len(next(k for k in self.kd_by_row if k is not None))
             stacked_kd = [
@@ -584,9 +571,9 @@ class _StreamingStudent:
             stacked_kd = None
             student_pos = []
 
-        lm_loss = self.lm_sum / self.lm_count.clamp(min=1)
         return (
-            lm_loss,
+            self.lm_sum,
+            self.lm_count,
             stacked_kd,
             torch.tensor(student_pos, device=self.device, dtype=self._pos_dtype),
             self.calls,
@@ -601,7 +588,7 @@ def streaming_student_outputs(
     attention_mask: torch.Tensor,
     batch_idx: torch.Tensor,
     teacher_pos: torch.Tensor,
-) -> tuple[torch.Tensor, list[torch.Tensor] | None, torch.Tensor, int, int]:
+) -> tuple[torch.Tensor, torch.Tensor, list[torch.Tensor] | None, torch.Tensor, int, int]:
     return _StreamingStudent(
         model,
         input_ids,

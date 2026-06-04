@@ -12,17 +12,19 @@ with the prompt prefix set to ``-100``).
 
 from __future__ import annotations
 
+import logging
 from functools import partial
 
 import torch
 import torch.distributed as dist
-from torch.utils.data import DataLoader
-from torch.utils.data.distributed import DistributedSampler
+from torch.utils.data import DataLoader, Sampler
 
 from evals.trace_analysis.ground_truth import ground_truth_trace, make_trace_context
 from evals.trace_analysis.trace_format import render_frames_to_generation
 
 from cwm.training.distributed import DistState
+
+logger = logging.getLogger(__name__)
 
 IGNORE_INDEX = -100
 
@@ -79,6 +81,100 @@ def collate_codi_batch(batch, pad_id: int) -> dict[str, torch.Tensor]:
     }
 
 
+class MegabatchSortishSampler(Sampler[list[int]]):
+    """Length-bucketed batch sampler that keeps most of the random-batching i.i.d.
+
+    Shuffles globally, sorts within megabatches of ``batch_size * megabatch_mult``
+    to pack similar-length traces together (cuts padding -> frees memory), then
+    shuffles batch order so no length curriculum survives. Larger ``megabatch_mult``
+    saves more padding but makes batches more difficulty-homogeneous; small values
+    stay close to pure random batching. DP-sharded so every rank yields the same
+    number of batches (DDP-safe).
+
+    When ``max_batch_tokens`` is set, batches are sized by a padded-token budget
+    instead of a fixed count: each batch holds at most ``max_batch_tokens //
+    longest_row`` rows (still capped at ``batch_size``). Long traces -> smaller
+    batches, so peak memory is bounded by the budget rather than by the worst-case
+    all-long batch that fixed-size length-sorting produces (which OOMs).
+    """
+
+    def __init__(
+        self,
+        lengths: list[int],
+        *,
+        batch_size: int,
+        megabatch_mult: int = 8,
+        max_batch_tokens: int = 0,
+        num_replicas: int = 1,
+        rank: int = 0,
+        shuffle: bool = True,
+        seed: int = 0,
+        drop_last: bool = False,
+    ) -> None:
+        self.lengths = lengths
+        self.batch_size = batch_size
+        self.megabatch_mult = max(1, megabatch_mult)
+        self.max_batch_tokens = max(0, max_batch_tokens)
+        self.num_replicas = max(1, num_replicas)
+        self.rank = rank
+        self.shuffle = shuffle
+        self.seed = seed
+        self.drop_last = drop_last
+        self.epoch = 0
+        # Batch count varies per epoch; cache so __len__ and __iter__ stay in sync.
+        self._batches = self._build(0)
+
+    def set_epoch(self, epoch: int) -> None:
+        self.epoch = epoch
+        self._batches = self._build(epoch)
+
+    def _split_megabatch(self, mb: list[int]) -> list[list[int]]:
+        """Slice a length-descending megabatch into batches under the token budget."""
+        if not self.max_batch_tokens:
+            return [mb[j : j + self.batch_size] for j in range(0, len(mb), self.batch_size)]
+        out: list[list[int]] = []
+        j = 0
+        while j < len(mb):
+            head = self.lengths[mb[j]]  # longest remaining -> this batch's padded width
+            cap = min(self.batch_size, max(1, self.max_batch_tokens // head))
+            out.append(mb[j : j + cap])
+            j += cap
+        return out
+
+    def _build(self, epoch: int) -> list[list[int]]:
+        g = torch.Generator().manual_seed(self.seed + epoch)
+        n = len(self.lengths)
+        order = (
+            torch.randperm(n, generator=g).tolist() if self.shuffle else list(range(n))
+        )
+        mb_size = self.batch_size * self.megabatch_mult
+        batches: list[list[int]] = []
+        for i in range(0, n, mb_size):
+            mb = sorted(order[i : i + mb_size], key=lambda idx: self.lengths[idx], reverse=True)
+            batches.extend(self._split_megabatch(mb))
+        if self.drop_last and not self.max_batch_tokens:
+            batches = [b for b in batches if len(b) == self.batch_size]
+        if self.shuffle:
+            batches = [batches[k] for k in torch.randperm(len(batches), generator=g).tolist()]
+
+        if self.num_replicas > 1 and batches:
+            rem = len(batches) % self.num_replicas
+            if rem:
+                if self.drop_last:
+                    batches = batches[: len(batches) - rem]
+                else:  # pad by cycling so every rank gets an equal count
+                    pad = self.num_replicas - rem
+                    batches += [batches[k % len(batches)] for k in range(pad)]
+            batches = batches[self.rank :: self.num_replicas]
+        return batches
+
+    def __iter__(self):
+        return iter(self._batches)
+
+    def __len__(self) -> int:
+        return len(self._batches)
+
+
 def build_codi_dataloader(
     *,
     tokenizer,
@@ -89,7 +185,9 @@ def build_codi_dataloader(
     batch_size: int,
     num_workers: int,
     seed: int,
-) -> tuple[DataLoader, DistributedSampler | None]:
+    megabatch_mult: int = 8,
+    max_batch_tokens: int = 0,
+) -> tuple[DataLoader, MegabatchSortishSampler]:
     if dist_state.is_rank_zero or not dist_state.enabled:
         dataset = build_dataset(tokenizer, n_samples=n_samples, max_seq_len=max_seq_len)
     else:
@@ -100,26 +198,33 @@ def build_codi_dataloader(
         dist.broadcast_object_list(obj, src=0, device=dist_state.device)
         dataset = obj[0]
 
-    sampler = (
-        DistributedSampler(
-            dataset,
-            num_replicas=dist_state.dp_size,
-            rank=dist_state.dp_rank,
-            shuffle=True,
-            seed=seed,
-        )
-        if dist_state.dp_enabled
-        else None
+    lengths = [len(ids) for ids, _ in dataset]
+    # max_batch_tokens: 0 = no limit (fixed batch_size); >0 = padded-token budget per batch.
+    batch_sampler = MegabatchSortishSampler(
+        lengths,
+        batch_size=batch_size,
+        megabatch_mult=megabatch_mult,
+        max_batch_tokens=max_batch_tokens,
+        num_replicas=dist_state.dp_size if dist_state.dp_enabled else 1,
+        rank=dist_state.dp_rank if dist_state.dp_enabled else 0,
+        shuffle=True,
+        seed=seed,
     )
+    if dist_state.is_rank_zero or not dist_state.enabled:
+        batches = batch_sampler._batches
+        sizes = [len(b) for b in batches]
+        loads = [max(lengths[i] for i in b) * len(b) for b in batches]
+        logger.info(
+            "codi batch budget: max_batch_tokens=%d  batches/rank=%d  rows/batch=%d-%d  "
+            "peak padded load=%d tok",
+            max_batch_tokens, len(sizes), min(sizes), max(sizes), max(loads),
+        )
 
     loader = DataLoader(
         dataset,
-        batch_size=batch_size,
-        shuffle=sampler is None,
-        sampler=sampler,
+        batch_sampler=batch_sampler,
         collate_fn=partial(collate_codi_batch, pad_id=pad_id),
         num_workers=num_workers,
         pin_memory=True,
-        generator=torch.Generator().manual_seed(seed),
     )
-    return loader, sampler
+    return loader, batch_sampler

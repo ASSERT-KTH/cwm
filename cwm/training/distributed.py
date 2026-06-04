@@ -1,12 +1,16 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 from dataclasses import dataclass
+from datetime import timedelta
 from typing import Any
 import os
 
 import torch
 import torch.distributed as dist
+import torch.distributed.distributed_c10d as c10d
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+
+COLLECTIVE_TIMEOUT = timedelta(minutes=3)
 
 
 @dataclass
@@ -47,7 +51,11 @@ def init_distributed(*, tp_size: int, dp_size: int = 0) -> DistState:
 
     world_size = int(os.environ.get("WORLD_SIZE", 1))
     if world_size > 1:
-        dist.init_process_group(backend="nccl")
+        # subgroups don't inherit this timeout; override both module defaults
+        # (backend string picks one) so dp/tp subgroups use it too.
+        c10d.default_pg_nccl_timeout = COLLECTIVE_TIMEOUT
+        c10d.default_pg_timeout = COLLECTIVE_TIMEOUT
+        dist.init_process_group(backend="nccl", timeout=COLLECTIVE_TIMEOUT)
         rank = dist.get_rank()
         local_rank = int(os.environ["LOCAL_RANK"])
         if torch.cuda.is_available():
@@ -109,11 +117,10 @@ def sync_gradients(params: list[torch.nn.Parameter], state: DistState) -> None:
     if not state.dp_enabled:
         return
     for param in params:
+        # all ranks must all_reduce the SAME param set; a grad that is None on
+        # one rank but present on another desyncs collectives and deadlocks NCCL.
         if param.grad is None:
-            continue
-        if param.grad.device.type != "cuda":
-            raise RuntimeError(
-                f"Cannot synchronize non-CUDA gradient on {param.grad.device}"
-            )
+            param.grad = torch.zeros_like(param)
+        # SUM, not mean: each rank's loss is already scaled by local/global count
+        # (see CodiModel._dp_loss_weights), so summed grads = global-mean grad.
         dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=state.dp_group)
-        param.grad.div_(state.dp_size)
