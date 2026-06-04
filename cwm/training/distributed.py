@@ -10,7 +10,7 @@ import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 
-COLLECTIVE_TIMEOUT = timedelta(minutes=3)
+COLLECTIVE_TIMEOUT = timedelta(minutes=10)
 
 
 @dataclass

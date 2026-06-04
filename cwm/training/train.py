@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import sys
 import time
 from dataclasses import dataclass
@@ -87,6 +88,7 @@ def main(args: TrainArgs) -> None:
         raise ValueError("qlora (bitsandbytes 4-bit) is incompatible with tp_size > 1")
 
     dist_state = init_distributed(tp_size=args.tp_size, dp_size=args.dp_size)
+    wandb_run = None
     try:
         torch.manual_seed(args.seed + dist_state.dp_rank)
         tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
@@ -174,11 +176,20 @@ def main(args: TrainArgs) -> None:
             os.environ.setdefault("WANDB_DIR", args.output_dir)
             import wandb
 
-            wandb.init(
+            wandb_run = wandb.init(
                 project="codi_distill_cwm",
                 name=_wandb_name(args, dist_state),
                 config=vars(args),
             )
+
+            # torchrun kills rank 0 with SIGTERM when another rank fails (e.g.
+            # OOM on rank 3). Flush + mark the run crashed before the hard exit,
+            # otherwise it stays stuck "running" on the dashboard.
+            def _on_sigterm(signum, frame):
+                wandb_run.finish(exit_code=1)
+                os._exit(1)
+
+            signal.signal(signal.SIGTERM, _on_sigterm)
 
         out_dir = Path(args.output_dir)
 
@@ -377,6 +388,13 @@ def main(args: TrainArgs) -> None:
             dist_state.rank,
             dist_state.world_size,
         )
+        if wandb_run is not None:
+            # Flush buffered metrics and mark the run crashed before the hard
+            # exit below; os._exit() would skip wandb's atexit/sync flush.
+            try:
+                wandb_run.finish(exit_code=1)
+            except Exception:
+                logger.exception("wandb.finish() failed during crash handling")
         sys.stdout.flush()
         sys.stderr.flush()
         if dist_state.enabled:

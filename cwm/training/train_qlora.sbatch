@@ -1,9 +1,9 @@
 #!/bin/bash
 #SBATCH -J cwm-codi-qlora
-#SBATCH -t 04:00:00
+#SBATCH -t 10:00:00
 #SBATCH -N 1
 #SBATCH --gpus=4
-#SBATCH -C "thin"
+#SBATCH -C "fat"
 #SBATCH -o logs/codi_qlora_%j.out
 #SBATCH -e logs/codi_qlora_%j.err
 
@@ -19,11 +19,11 @@
 #   2048   | 778 (97.2%)  |
 #   3072   | 789 (98.6%)  |
 LATENT_STEPS=2
-N_SAMPLES=16
-MAX_SEQ_LEN=1000
-MAX_BATCH_TOKENS=1000
-EPOCHS=1
-BATCH_SIZE=4
+N_SAMPLES=0 # 0 for full dataset
+MAX_SEQ_LEN=2560
+MAX_BATCH_TOKENS=2048 # ~800 using 40GB A100s; ~2560 for 80GB A100s.
+EPOCHS=5
+BATCH_SIZE=8
 GRAD_ACCUM_STEPS=1
 
 # Name encodes the params so squeue / dirs / logs are self-describing.
@@ -40,9 +40,13 @@ cd /home/x_sirli/distill_cwm/cwm_andre
 
 # Compute nodes are online: wandb syncs to the cloud directly; logs also kept under $OUT/wandb.
 export WANDB_DIR=${OUT}
+export WANDB_MODE=online
 export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 # on collective timeout, abort comms and crash the rank (don't dead-loop)
 export TORCH_NCCL_ASYNC_ERROR_HANDLING=1
+# local cruxeval copy -> skips HF builder FileLock
+export CRUXEVAL_DIR=/proj/assert-berzelius/users/x_sirli/datasets/cruxeval_test
+export HF_DATASETS_OFFLINE=1
 mkdir -p ${OUT} logs
 
 torchrun --standalone --nproc_per_node=4 -m cwm.training.train \

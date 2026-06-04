@@ -57,9 +57,18 @@ def build_example(
 
 def build_dataset(tokenizer, *, n_samples: int = -1, max_seq_len: int = 8192) -> list[tuple[list[int], list[int]]]:
     """Tokenized CRUXEval-O traces. ``n_samples<=0`` uses all 800."""
-    from datasets import load_dataset
+    import os
 
-    rows = list(load_dataset("cruxeval-org/cruxeval", split="test"))
+    # Prefer local save_to_disk copy; HF builder FileLock dies on NFS caches.
+    local_dir = os.environ.get("CRUXEVAL_DIR")
+    if local_dir and os.path.isdir(local_dir):
+        from datasets import load_from_disk
+
+        rows = list(load_from_disk(local_dir))
+    else:
+        from datasets import load_dataset
+
+        rows = list(load_dataset("cruxeval-org/cruxeval", split="test"))
     if n_samples > 0:
         rows = rows[:n_samples]
     examples = (build_example(r["code"], r["input"], tokenizer, max_seq_len=max_seq_len) for r in rows)
