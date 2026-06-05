@@ -97,8 +97,9 @@ class MegabatchSortishSampler(Sampler[list[int]]):
     to pack similar-length traces together (cuts padding -> frees memory), then
     shuffles batch order so no length curriculum survives. Larger ``megabatch_mult``
     saves more padding but makes batches more difficulty-homogeneous; small values
-    stay close to pure random batching. DP-sharded so every rank yields the same
-    number of batches (DDP-safe).
+    stay close to pure random batching. DP-sharded with per-window load balancing
+    (see ``_build``) so every rank yields the same number of batches and finishes
+    each grad-accum window with near-equal work (DDP-safe, no straggler).
 
     When ``max_batch_tokens`` is set, batches are sized by a padded-token budget
     instead of a fixed count: each batch holds at most ``max_batch_tokens //
@@ -112,6 +113,7 @@ class MegabatchSortishSampler(Sampler[list[int]]):
         lengths: list[int],
         *,
         batch_size: int,
+        grad_accum_steps: int = 1,
         megabatch_mult: int = 8,
         max_batch_tokens: int = 0,
         num_replicas: int = 1,
@@ -122,6 +124,7 @@ class MegabatchSortishSampler(Sampler[list[int]]):
     ) -> None:
         self.lengths = lengths
         self.batch_size = batch_size
+        self.grad_accum_steps = max(1, grad_accum_steps)
         self.megabatch_mult = max(1, megabatch_mult)
         self.max_batch_tokens = max(0, max_batch_tokens)
         self.num_replicas = max(1, num_replicas)
@@ -167,14 +170,31 @@ class MegabatchSortishSampler(Sampler[list[int]]):
             batches = [batches[k] for k in torch.randperm(len(batches), generator=g).tolist()]
 
         if self.num_replicas > 1 and batches:
-            rem = len(batches) % self.num_replicas
+            # Load-balance per grad-accum window: each window (num_replicas *
+            # grad_accum_steps consecutive batches, a random difficulty mix) is
+            # greedily split into num_replicas bins of grad_accum_steps each,
+            # equalizing each rank's real-token load. All ranks then finish the
+            # window together and sync once at its grad all-reduce -> no per-step
+            # straggler, and windows stay random (no curriculum at the step level).
+            R, N = self.num_replicas, self.grad_accum_steps
+            win = R * N
+            rem = len(batches) % win
             if rem:
                 if self.drop_last:
                     batches = batches[: len(batches) - rem]
-                else:  # pad by cycling so every rank gets an equal count
-                    pad = self.num_replicas - rem
-                    batches += [batches[k % len(batches)] for k in range(pad)]
-            batches = batches[self.rank :: self.num_replicas]
+                else:  # cycle-pad to whole windows so every rank gets equal count
+                    batches += [batches[k % len(batches)] for k in range(win - rem)]
+            load = lambda b: sum(self.lengths[i] for i in b)
+            mine: list[list[int]] = []
+            for w in range(0, len(batches), win):
+                bins: list[list[int]] = [[] for _ in range(R)]
+                sums = [0] * R
+                for b in sorted(batches[w : w + win], key=load, reverse=True):
+                    r = min((i for i in range(R) if len(bins[i]) < N), key=lambda i: sums[i])
+                    bins[r].append(b)
+                    sums[r] += load(b)
+                mine.extend(bins[self.rank])
+            batches = mine
         return batches
 
     def __iter__(self):
@@ -192,6 +212,7 @@ def build_codi_dataloader(
     n_samples: int,
     max_seq_len: int,
     batch_size: int,
+    grad_accum_steps: int = 1,
     num_workers: int,
     seed: int,
     megabatch_mult: int = 8,
@@ -212,6 +233,7 @@ def build_codi_dataloader(
     batch_sampler = MegabatchSortishSampler(
         lengths,
         batch_size=batch_size,
+        grad_accum_steps=grad_accum_steps,
         megabatch_mult=megabatch_mult,
         max_batch_tokens=max_batch_tokens,
         num_replicas=dist_state.dp_size if dist_state.dp_enabled else 1,

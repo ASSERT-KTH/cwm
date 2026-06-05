@@ -2,7 +2,7 @@
 #SBATCH -J cwm-codi-qlora
 #SBATCH -t 10:00:00
 #SBATCH -N 1
-#SBATCH --gpus=4
+#SBATCH --gpus=2
 #SBATCH -C "fat"
 #SBATCH -o logs/codi_qlora_%j.out
 #SBATCH -e logs/codi_qlora_%j.err
@@ -18,16 +18,18 @@
 #   1536   | 763 (95.4%)  |
 #   2048   | 778 (97.2%)  |
 #   3072   | 789 (98.6%)  |
-LATENT_STEPS=2
+LATENT_STEPS=1
 N_SAMPLES=0 # 0 for full dataset
-MAX_SEQ_LEN=2560
-MAX_BATCH_TOKENS=2048 # ~800 using 40GB A100s; ~2560 for 80GB A100s.
+MAX_SEQ_LEN=2048
+MAX_BATCH_TOKENS=2048 # ~800 using 40GB A100s; ~2048 for 80GB A100s.
 EPOCHS=5
-BATCH_SIZE=8
+BATCH_SIZE=32
 GRAD_ACCUM_STEPS=1
+LM_LOSS_WEIGHT=1.0
+KD_LOSS_WEIGHT=1.0
 
 # Name encodes the params so squeue / dirs / logs are self-describing.
-NAME=codi_qlora_l${LATENT_STEPS}_n${N_SAMPLES}_s${MAX_SEQ_LEN}_b${BATCH_SIZE}x${GRAD_ACCUM_STEPS}_e${EPOCHS}
+NAME=codi_qlora_l${LATENT_STEPS}_n${N_SAMPLES}_s${MAX_SEQ_LEN}_b${BATCH_SIZE}x${GRAD_ACCUM_STEPS}_lmw${LM_LOSS_WEIGHT}_kdw${KD_LOSS_WEIGHT}_e${EPOCHS}
 # #SBATCH -J is static (parsed before the shell runs), so rename the live job.
 scontrol update JobId=${SLURM_JOB_ID} JobName=${NAME} 2>/dev/null
 
@@ -49,12 +51,13 @@ export CRUXEVAL_DIR=/proj/assert-berzelius/users/x_sirli/datasets/cruxeval_test
 export HF_DATASETS_OFFLINE=1
 mkdir -p ${OUT} logs
 
-torchrun --standalone --nproc_per_node=4 -m cwm.training.train \
+torchrun --standalone --nproc_per_node=2 -m cwm.training.train \
     model_name_or_path=model_weights/cwm_hf \
     output_dir=${OUT} \
     qlora=true \
     latent_steps=${LATENT_STEPS} n_samples=${N_SAMPLES} \
+    lm_loss_weight=${LM_LOSS_WEIGHT} kd_loss_weight=${KD_LOSS_WEIGHT} \
     max_seq_len=${MAX_SEQ_LEN} max_batch_tokens=${MAX_BATCH_TOKENS} epochs=${EPOCHS} \
     batch_size=${BATCH_SIZE} grad_accum_steps=${GRAD_ACCUM_STEPS} \
-    tp_size=1 dp_size=4 \
+    tp_size=1 dp_size=2 \
     flash_attn=true wandb_log=true timing_log_every=1

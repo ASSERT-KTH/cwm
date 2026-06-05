@@ -20,7 +20,7 @@ class CodiConfig:
     kd_loss: Literal["l1", "smooth_l1", "mse"] = "l1"
     normalize_kd_by_teacher_std: bool = True
     kd_eps: float = 1e-6
-    kd_layers: tuple[int, ...] | None = None
+    kd_layers: tuple[int, ...] | None = (-1,)
     lora_r: int = 16
     lora_alpha: int = 32
     lora_dropout: float = 0.05
@@ -37,6 +37,10 @@ class CodiConfig:
     def __post_init__(self) -> None:
         if self.latent_steps < 0:
             raise ValueError("latent_steps must be non-negative")
+        if self.lm_loss_weight < 0:
+            raise ValueError("lm_loss_weight must be non-negative")
+        if self.kd_loss_weight < 0:
+            raise ValueError("kd_loss_weight must be non-negative")
         if self.distill_offset < 0:
             raise ValueError("distill_offset must be non-negative")
         if self.lora_r <= 0:
@@ -75,7 +79,9 @@ def default_codi_config_from_tokenizer(
     tokenizer,
     *,
     latent_steps: int,
-    kd_layers: tuple[int, ...] | None = None,
+    kd_layers: tuple[int, ...] | None = (-1,),
+    lm_loss_weight: float = 1.0,
+    kd_loss_weight: float = 1.0,
 ) -> CodiConfig:
     return CodiConfig(
         latent_span_start_token_id=cwm_token_id(tokenizer, "<|line_sep|>"),
@@ -84,6 +90,8 @@ def default_codi_config_from_tokenizer(
         latent_end_token_id=cwm_token_id(tokenizer, "<|reasoning_thinking_end|>"),
         latent_steps=latent_steps,
         kd_layers=kd_layers,
+        lm_loss_weight=lm_loss_weight,
+        kd_loss_weight=kd_loss_weight,
     )
 
 

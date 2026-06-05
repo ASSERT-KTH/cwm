@@ -19,7 +19,7 @@ import os
 import signal
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 
 import torch
@@ -44,10 +44,14 @@ class TrainArgs:
     model_name_or_path: str = "facebook/cwm"
     output_dir: str = "./codi-cruxeval"
     latent_steps: int = 2
-    kd_layers: list[int] | None = None  # None = all layers; e.g. [-1] for last only
+    kd_layers: list[int] | None = field(
+        default_factory=lambda: [-1]
+    )  # [-1] = last layer only; None for all layers
     use_thought_projector: bool = True
     qlora: bool = False  # load base in 4-bit NF4 (bitsandbytes); teacher runs on the quantized base
     lr: float = 1e-4
+    lm_loss_weight: float = 1.0
+    kd_loss_weight: float = 1.0
     epochs: int = 1
     batch_size: int = 1
     grad_accum_steps: int = 1
@@ -75,6 +79,7 @@ def _wandb_name(args: TrainArgs, dist_state) -> str:
     return (
         f"codi_{'qlora' if args.qlora else 'full'}_lat{args.latent_steps}_kd{kd}"
         f"_bs{args.batch_size}x{args.grad_accum_steps}_lr{args.lr:g}"
+        f"_lmw{args.lm_loss_weight:g}_kdw{args.kd_loss_weight:g}"
         f"_seq{args.max_seq_len}_mbt{args.max_batch_tokens}"
         f"_ep{args.epochs}_dp{dist_state.dp_size}_tp{dist_state.tp_size}"
         f"_proj{int(args.use_thought_projector)}_seed{args.seed}"
@@ -97,6 +102,8 @@ def main(args: TrainArgs) -> None:
             tokenizer,
             latent_steps=args.latent_steps,
             kd_layers=tuple(args.kd_layers) if args.kd_layers else None,
+            lm_loss_weight=args.lm_loss_weight,
+            kd_loss_weight=args.kd_loss_weight,
         )
 
         kwargs: dict = {"dtype": torch.bfloat16}
@@ -124,7 +131,6 @@ def main(args: TrainArgs) -> None:
             student=student,
             config=config,
             use_thought_projector=args.use_thought_projector,
-            dp_group=dist_state.dp_group if dist_state.dp_enabled else None,
         )
         is_sharded_model = dist_state.tp_enabled or args.qlora
         if not is_sharded_model:
@@ -138,6 +144,8 @@ def main(args: TrainArgs) -> None:
         )
         device = model.input_embeddings.weight.device
 
+        if args.grad_accum_steps <= 0:
+            raise ValueError("grad_accum_steps must be positive")
         loader, sampler = build_codi_dataloader(
             tokenizer=tokenizer,
             pad_id=pad_id,
@@ -145,13 +153,12 @@ def main(args: TrainArgs) -> None:
             n_samples=args.n_samples,
             max_seq_len=args.max_seq_len,
             batch_size=args.batch_size,
+            grad_accum_steps=args.grad_accum_steps,
             num_workers=args.num_workers,
             seed=args.seed,
             megabatch_mult=args.megabatch_mult,
             max_batch_tokens=args.max_batch_tokens,
         )
-        if args.grad_accum_steps <= 0:
-            raise ValueError("grad_accum_steps must be positive")
 
         params = [p for p in model.parameters() if p.requires_grad]
         logger.info(

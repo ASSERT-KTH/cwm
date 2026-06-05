@@ -2,7 +2,6 @@
 
 from dataclasses import dataclass
 import torch
-import torch.distributed as dist
 import torch.nn.functional as F
 from torch import nn
 
@@ -26,12 +25,10 @@ class CodiModel(nn.Module):
         student: nn.Module,
         config: CodiConfig,
         use_thought_projector: bool = False,
-        dp_group=None,
     ) -> None:
         super().__init__()
         self.student = apply_lora(student, config)
         self.config = config
-        self.dp_group = dp_group  # DP process group for exact token-weighted loss
 
         self.thought_projector = None
         if use_thought_projector:
@@ -104,16 +101,6 @@ class CodiModel(nn.Module):
             for s_v, t_v in zip(student_kd_vecs, teacher_kd_vecs, strict=True)
         ]
         return torch.stack(losses).mean()
-
-    def _dp_loss_weights(self, lm_count: torch.Tensor, kd_count: int):
-        """Per-rank loss scale = local_count / global_count, so all-reduce-SUM
-        of grads yields the exact global token/position mean. 1.0 outside DP."""
-        if self.dp_group is None:
-            return 1.0, 1.0
-        local = torch.stack([lm_count, lm_count.new_tensor(kd_count)]).float()
-        total = local.clone()
-        dist.all_reduce(total, op=dist.ReduceOp.SUM, group=self.dp_group)
-        return (local / total.clamp(min=1)).unbind()
 
     def _teacher_kd_vecs(
         self,
@@ -194,14 +181,13 @@ class CodiModel(nn.Module):
 
         lm_loss = lm_sum / lm_count.clamp(min=1)
         kd_loss = self._kd_loss(student_kd_vecs, teacher_kd_vecs, lm_loss)
-        true_loss = self.config.lm_loss_weight * lm_loss + self.config.kd_loss_weight * kd_loss
-        # Backward on a token/position-weighted loss (pairs with all-reduce-SUM
-        # grads); true_loss is the unweighted value for logging.
-        lm_w, kd_w = self._dp_loss_weights(lm_count, batch_idx.numel())
-        loss = self.config.lm_loss_weight * lm_loss * lm_w + self.config.kd_loss_weight * kd_loss * kd_w
+        # Local per-token/position mean; grads are averaged across DP ranks in
+        # sync_gradients. The sampler equalizes each rank's per-window token load,
+        # so this plain rank-mean matches the global token-mean.
+        loss = self.config.lm_loss_weight * lm_loss + self.config.kd_loss_weight * kd_loss
         kd_positions = torch.stack((batch_idx, teacher_pos, student_pos), dim=1)
         metrics = {
-            "loss": true_loss.detach(),
+            "loss": loss.detach(),
             "lm_loss": lm_loss.detach(),
             "kd_loss": kd_loss.detach(),
             "num_kd_positions": torch.tensor(

@@ -121,6 +121,6 @@ def sync_gradients(params: list[torch.nn.Parameter], state: DistState) -> None:
         # one rank but present on another desyncs collectives and deadlocks NCCL.
         if param.grad is None:
             param.grad = torch.zeros_like(param)
-        # SUM, not mean: each rank's loss is already scaled by local/global count
-        # (see CodiModel._dp_loss_weights), so summed grads = global-mean grad.
-        dist.all_reduce(param.grad, op=dist.ReduceOp.SUM, group=state.dp_group)
+        # Mean across DP ranks: each rank holds a per-token-mean loss grad, and
+        # the sampler balances per-rank token load so the rank-mean = global mean.
+        dist.all_reduce(param.grad, op=dist.ReduceOp.AVG, group=state.dp_group)
