@@ -95,6 +95,10 @@ def main(args: TrainArgs) -> None:
 
     dist_state = init_distributed(tp_size=args.tp_size, dp_size=args.dp_size)
     wandb_run = None
+    # Bound before the try so the except block can reference them even if the
+    # crash happens before save_checkpoint is defined (None => skip crash-save).
+    save_checkpoint = None
+    out_dir = Path(args.output_dir)
     try:
         torch.manual_seed(args.seed + dist_state.dp_rank)
         tokenizer = AutoTokenizer.from_pretrained(args.model_name_or_path)
@@ -199,8 +203,6 @@ def main(args: TrainArgs) -> None:
                 os._exit(1)
 
             signal.signal(signal.SIGTERM, _on_sigterm)
-
-        out_dir = Path(args.output_dir)
 
         def save_checkpoint(path: Path) -> None:
             if not dist_state.is_rank_zero:
@@ -381,6 +383,8 @@ def main(args: TrainArgs) -> None:
                     window = new_window()
                     timing = new_timing()
 
+            save_checkpoint(out_dir / f"epoch-{epoch}")  # per-epoch history
+
         save_checkpoint(out_dir)  # final adapter (save_every_steps=0 saves only here)
 
         if torch.cuda.is_available():
@@ -397,6 +401,14 @@ def main(args: TrainArgs) -> None:
             dist_state.rank,
             dist_state.world_size,
         )
+        # Best-effort rescue save before the hard exit. rank0-only, no collective
+        # (safe while peers die); wrapped so an OOM-on-save can't mask the original
+        # exception or block the exit path.
+        if save_checkpoint is not None:
+            try:
+                save_checkpoint(out_dir / "crash")
+            except Exception:
+                logger.exception("crash-time checkpoint save failed")
         if wandb_run is not None:
             # Flush buffered metrics and mark the run crashed before the hard
             # exit below; os._exit() would skip wandb's atexit finish hooks.
