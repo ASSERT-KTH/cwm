@@ -114,6 +114,8 @@ class CodiModel(nn.Module):
 
         # Per row, truncated to its real length so no padding enters the forward
         # (caps the hidden-state peak at one row instead of the full batch).
+        # Store only detached KD slices; the large per-row hidden-state tuple can
+        # then be released before the student graph is built.
         teacher_kd: list[list[torch.Tensor]] | None = None
         for b in range(input_ids.shape[0]):
             row_mask = batch_idx == b
@@ -129,8 +131,9 @@ class CodiModel(nn.Module):
                 teacher_kd = [[] for _ in layers]
             positions = teacher_pos[row_mask]
             for layer_kd, h in zip(teacher_kd, layers, strict=True):
-                layer_kd.extend(h[0, positions])
-        return [torch.stack(layer).detach() for layer in teacher_kd]
+                layer_kd.append(h[0, positions].detach())
+            del out, layers
+        return [torch.cat(layer, dim=0) for layer in teacher_kd]
 
     def forward(
         self,
@@ -144,22 +147,6 @@ class CodiModel(nn.Module):
             labels,
             attention_mask,
         )
-        (
-            lm_sum,
-            lm_count,
-            student_kd_vecs,
-            student_pos,
-            student_model_calls,
-            student_tokens,
-        ) = streaming_student_outputs(
-            self,
-            input_ids,
-            labels,
-            attention_mask,
-            batch_idx,
-            teacher_pos,
-        )
-
         with torch.no_grad():
             disable_adapter = getattr(self.student, "disable_adapter", None)
             if disable_adapter is None:
@@ -178,6 +165,22 @@ class CodiModel(nn.Module):
                     )
             finally:
                 self.student.train(was_training)
+
+        (
+            lm_sum,
+            lm_count,
+            student_kd_vecs,
+            student_pos,
+            student_model_calls,
+            student_tokens,
+        ) = streaming_student_outputs(
+            self,
+            input_ids,
+            labels,
+            attention_mask,
+            batch_idx,
+            teacher_pos,
+        )
 
         lm_loss = lm_sum / lm_count.clamp(min=1)
         kd_loss = self._kd_loss(student_kd_vecs, teacher_kd_vecs, lm_loss)
