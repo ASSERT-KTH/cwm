@@ -55,8 +55,29 @@ def build_example(
     return input_ids, [IGNORE_INDEX] * len(prompt_ids) + trace_ids
 
 
-def build_dataset(tokenizer, *, n_samples: int = -1, max_seq_len: int = 8192) -> list[tuple[list[int], list[int]]]:
-    """Tokenized CRUXEval-O traces. ``n_samples<=0`` uses all 800."""
+def cruxeval_split(rows, split: str = "all", val_stride: int = 5):
+    """Deterministic interleaved train/val split of the CRUXEval rows.
+
+    ``val`` = every ``val_stride``-th row (800/5 = 160 val, 640 train);
+    interleaving keeps the length/difficulty distribution matched across splits.
+    Single source of truth: both training (``build_dataset``) and eval
+    (``run_eval_codi``) import this so the splits never drift.
+    ``split`` in {"train", "val", "all"}.
+    """
+    if split == "all":
+        return list(rows)
+    is_val = lambda i: i % val_stride == 0
+    if split == "val":
+        return [r for i, r in enumerate(rows) if is_val(i)]
+    if split == "train":
+        return [r for i, r in enumerate(rows) if not is_val(i)]
+    raise ValueError(f"split must be train/val/all, got {split!r}")
+
+
+def build_dataset(
+    tokenizer, *, n_samples: int = -1, max_seq_len: int = 8192, split: str = "all"
+) -> list[tuple[list[int], list[int]]]:
+    """Tokenized CRUXEval-O traces. ``n_samples<=0`` uses all of ``split``."""
     import os
 
     # Prefer local save_to_disk copy; HF builder FileLock dies on NFS caches.
@@ -69,6 +90,7 @@ def build_dataset(tokenizer, *, n_samples: int = -1, max_seq_len: int = 8192) ->
         from datasets import load_dataset
 
         rows = list(load_dataset("cruxeval-org/cruxeval", split="test"))
+    rows = cruxeval_split(rows, split)
     if n_samples > 0:
         rows = rows[:n_samples]
     examples = (build_example(r["code"], r["input"], tokenizer, max_seq_len=max_seq_len) for r in rows)
@@ -217,9 +239,12 @@ def build_codi_dataloader(
     seed: int,
     megabatch_mult: int = 8,
     max_batch_tokens: int = 0,
+    split: str = "train",
 ) -> tuple[DataLoader, MegabatchSortishSampler]:
     if dist_state.is_rank_zero or not dist_state.enabled:
-        dataset = build_dataset(tokenizer, n_samples=n_samples, max_seq_len=max_seq_len)
+        dataset = build_dataset(
+            tokenizer, n_samples=n_samples, max_seq_len=max_seq_len, split=split
+        )
     else:
         dataset = None
 

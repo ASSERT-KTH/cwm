@@ -58,6 +58,7 @@ class TrainArgs:
     max_grad_norm: float = 1.0
     save_every_steps: int = 0  # 0 = save only at end
     n_samples: int = -1
+    data_split: str = "train"  # train/val/all (cruxeval_split); train holds out the val sweep set
     max_seq_len: int = 8192
     megabatch_mult: int = 8  # length-bucketing strength; larger packs tighter (less padding) but more difficulty-homogeneous batches
     max_batch_tokens: int = 0  # 0 = fixed batch_size; >0 = padded-token budget per batch
@@ -158,6 +159,7 @@ def main(args: TrainArgs) -> None:
             seed=args.seed,
             megabatch_mult=args.megabatch_mult,
             max_batch_tokens=args.max_batch_tokens,
+            split=args.data_split,
         )
 
         params = [p for p in model.parameters() if p.requires_grad]
@@ -179,8 +181,8 @@ def main(args: TrainArgs) -> None:
 
         use_wandb = args.wandb_log and dist_state.is_rank_zero
         if use_wandb:
-            os.environ.setdefault("WANDB_MODE", "offline")
-            os.environ.setdefault("WANDB_DIR", args.output_dir)
+            os.environ["WANDB_MODE"] = "online"
+            os.environ["WANDB_DIR"] = args.output_dir
             import wandb
 
             wandb_run = wandb.init(
@@ -397,7 +399,7 @@ def main(args: TrainArgs) -> None:
         )
         if wandb_run is not None:
             # Flush buffered metrics and mark the run crashed before the hard
-            # exit below; os._exit() would skip wandb's atexit/sync flush.
+            # exit below; os._exit() would skip wandb's atexit finish hooks.
             try:
                 wandb_run.finish(exit_code=1)
             except Exception:
