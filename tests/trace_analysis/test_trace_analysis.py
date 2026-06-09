@@ -11,13 +11,13 @@ perfect 100% on every Table 9 component.
 
 from __future__ import annotations
 
-from evals.trace_analysis.ground_truth import (
+from dataset.cruxeval.ground_truth import (
     ground_truth_trace,
     make_trace_context,
     render_value,
 )
 from evals.trace_analysis.metrics import compute_trace_metrics
-from evals.trace_analysis.trace_format import (
+from dataset.cruxeval.trace_format import (
     TraceEvent,
     parse_generated_trace,
     render_frames_to_generation,

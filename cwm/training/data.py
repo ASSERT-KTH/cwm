@@ -1,13 +1,7 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
-"""
-Ground-truth execution traces -> (input_ids, labels) for teacher-forcing CODI.
-
-Thin HuggingFace-tokenizer wrapper over the verbatim Table 9 trace generator
-(``evals.trace_analysis``). All trace logic is reused: we only build the seeded
-prompt, tokenize ``prompt + render_frames_to_generation(frames)``, and mask the
-prompt out of the labels (the student is teacher-forced, so labels == input_ids
-with the prompt prefix set to ``-100``).
+"""Length-bucketed DP-sharded batch sampler, padded collate, DataLoader builder.
+The dataset (split + trace -> ids/labels) lives in ``dataset.cruxeval.dataset``.
 """
 
 from __future__ import annotations
@@ -19,82 +13,10 @@ import torch
 import torch.distributed as dist
 from torch.utils.data import DataLoader, Sampler
 
-from evals.trace_analysis.ground_truth import ground_truth_trace, make_trace_context
-from evals.trace_analysis.trace_format import render_frames_to_generation
-
 from cwm.training.distributed import DistState
+from dataset.cruxeval.dataset import IGNORE_INDEX, build_dataset
 
 logger = logging.getLogger(__name__)
-
-IGNORE_INDEX = -100
-
-
-def _prompt_str(code: str, input_str: str) -> str:
-    ctx = make_trace_context(code, input_str)
-    return f"<|trace_context_start|>{ctx}<|frame_sep|><|call_sep|>{{}}<|action_sep|>def main():\n<|frame_sep|>"
-
-
-def build_example(
-    code: str, input_str: str, tokenizer, *, max_seq_len: int
-) -> tuple[list[int], list[int]] | None:
-    """Return ``(input_ids, labels)``, or None to skip (empty / too long).
-
-    A raised program is kept: its EXCEPTION frame is part of the trace to predict.
-    ``render_frames_to_generation`` already terminates the trace with ``<|end_of_text|>``.
-    """
-    frames, _error = ground_truth_trace(code, input_str, align_to_prompt=True)
-    if not frames:
-        return None
-    prompt_ids = [tokenizer.bos_token_id] + tokenizer.encode(
-        _prompt_str(code, input_str), add_special_tokens=False
-    )
-    trace_ids = tokenizer.encode(render_frames_to_generation(frames), add_special_tokens=False)
-    input_ids = prompt_ids + trace_ids
-    if len(input_ids) > max_seq_len:
-        return None
-    return input_ids, [IGNORE_INDEX] * len(prompt_ids) + trace_ids
-
-
-def cruxeval_split(rows, split: str = "all", val_stride: int = 5):
-    """Deterministic interleaved train/val split of the CRUXEval rows.
-
-    ``val`` = every ``val_stride``-th row (800/5 = 160 val, 640 train);
-    interleaving keeps the length/difficulty distribution matched across splits.
-    Single source of truth: both training (``build_dataset``) and eval
-    (``run_eval_codi``) import this so the splits never drift.
-    ``split`` in {"train", "val", "all"}.
-    """
-    if split == "all":
-        return list(rows)
-    is_val = lambda i: i % val_stride == 0
-    if split == "val":
-        return [r for i, r in enumerate(rows) if is_val(i)]
-    if split == "train":
-        return [r for i, r in enumerate(rows) if not is_val(i)]
-    raise ValueError(f"split must be train/val/all, got {split!r}")
-
-
-def build_dataset(
-    tokenizer, *, n_samples: int = -1, max_seq_len: int = 8192, split: str = "all"
-) -> list[tuple[list[int], list[int]]]:
-    """Tokenized CRUXEval-O traces. ``n_samples<=0`` uses all of ``split``."""
-    import os
-
-    # Prefer local save_to_disk copy; HF builder FileLock dies on NFS caches.
-    local_dir = os.environ.get("CRUXEVAL_DIR")
-    if local_dir and os.path.isdir(local_dir):
-        from datasets import load_from_disk
-
-        rows = list(load_from_disk(local_dir))
-    else:
-        from datasets import load_dataset
-
-        rows = list(load_dataset("cruxeval-org/cruxeval", split="test"))
-    rows = cruxeval_split(rows, split)
-    if n_samples > 0:
-        rows = rows[:n_samples]
-    examples = (build_example(r["code"], r["input"], tokenizer, max_seq_len=max_seq_len) for r in rows)
-    return [ex for ex in examples if ex is not None]
 
 
 def collate_codi_batch(batch, pad_id: int) -> dict[str, torch.Tensor]:
@@ -113,21 +35,14 @@ def collate_codi_batch(batch, pad_id: int) -> dict[str, torch.Tensor]:
 
 
 class MegabatchSortishSampler(Sampler[list[int]]):
-    """Length-bucketed batch sampler that keeps most of the random-batching i.i.d.
+    """Near-i.i.d. length-bucketed batch sampler.
 
-    Shuffles globally, sorts within megabatches of ``batch_size * megabatch_mult``
-    to pack similar-length traces together (cuts padding -> frees memory), then
-    shuffles batch order so no length curriculum survives. Larger ``megabatch_mult``
-    saves more padding but makes batches more difficulty-homogeneous; small values
-    stay close to pure random batching. DP-sharded with per-window load balancing
-    (see ``_build``) so every rank yields the same number of batches and finishes
-    each grad-accum window with near-equal work (DDP-safe, no straggler).
-
-    When ``max_batch_tokens`` is set, batches are sized by a padded-token budget
-    instead of a fixed count: each batch holds at most ``max_batch_tokens //
-    longest_row`` rows (still capped at ``batch_size``). Long traces -> smaller
-    batches, so peak memory is bounded by the budget rather than by the worst-case
-    all-long batch that fixed-size length-sorting produces (which OOMs).
+    Shuffle -> sort within ``batch_size*megabatch_mult`` megabatches (packs
+    similar lengths, cuts padding) -> reshuffle batch order (no curriculum).
+    DP-sharded with per-window load balancing (see ``_build``): equal batch
+    count and near-equal work per grad-accum window (DDP-safe).
+    ``max_batch_tokens>0`` sizes batches by padded-token budget instead of a
+    fixed count, bounding peak memory on long traces (else OOM).
     """
 
     def __init__(
@@ -155,7 +70,7 @@ class MegabatchSortishSampler(Sampler[list[int]]):
         self.seed = seed
         self.drop_last = drop_last
         self.epoch = 0
-        # Batch count varies per epoch; cache so __len__ and __iter__ stay in sync.
+        # cache: batch count varies per epoch, keep __len__/__iter__ in sync
         self._batches = self._build(0)
 
     def set_epoch(self, epoch: int) -> None:
@@ -163,13 +78,13 @@ class MegabatchSortishSampler(Sampler[list[int]]):
         self._batches = self._build(epoch)
 
     def _split_megabatch(self, mb: list[int]) -> list[list[int]]:
-        """Slice a length-descending megabatch into batches under the token budget."""
+        """Slice a length-descending megabatch into token-budget batches."""
         if not self.max_batch_tokens:
             return [mb[j : j + self.batch_size] for j in range(0, len(mb), self.batch_size)]
         out: list[list[int]] = []
         j = 0
         while j < len(mb):
-            head = self.lengths[mb[j]]  # longest remaining -> this batch's padded width
+            head = self.lengths[mb[j]]  # longest remaining = padded width
             cap = min(self.batch_size, max(1, self.max_batch_tokens // head))
             out.append(mb[j : j + cap])
             j += cap
@@ -192,19 +107,15 @@ class MegabatchSortishSampler(Sampler[list[int]]):
             batches = [batches[k] for k in torch.randperm(len(batches), generator=g).tolist()]
 
         if self.num_replicas > 1 and batches:
-            # Load-balance per grad-accum window: each window (num_replicas *
-            # grad_accum_steps consecutive batches, a random difficulty mix) is
-            # greedily split into num_replicas bins of grad_accum_steps each,
-            # equalizing each rank's real-token load. All ranks then finish the
-            # window together and sync once at its grad all-reduce -> no per-step
-            # straggler, and windows stay random (no curriculum at the step level).
+            # Per grad-accum window (R*N consecutive batches): greedily split into
+            # R bins of N, equalizing token load so ranks finish together (DDP).
             R, N = self.num_replicas, self.grad_accum_steps
             win = R * N
             rem = len(batches) % win
             if rem:
                 if self.drop_last:
                     batches = batches[: len(batches) - rem]
-                else:  # cycle-pad to whole windows so every rank gets equal count
+                else:  # cycle-pad to whole windows -> equal count per rank
                     batches += [batches[k % len(batches)] for k in range(win - rem)]
             load = lambda b: sum(self.lengths[i] for i in b)
             mine: list[list[int]] = []
@@ -254,7 +165,7 @@ def build_codi_dataloader(
         dataset = obj[0]
 
     lengths = [len(ids) for ids, _ in dataset]
-    # max_batch_tokens: 0 = no limit (fixed batch_size); >0 = padded-token budget per batch.
+    # max_batch_tokens: 0 = fixed batch_size; >0 = padded-token budget per batch
     batch_sampler = MegabatchSortishSampler(
         lengths,
         batch_size=batch_size,

@@ -9,6 +9,7 @@ import torch
 import torch.distributed as dist
 import torch.distributed.distributed_c10d as c10d
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
+from torch.distributed.tensor import DTensor
 
 COLLECTIVE_TIMEOUT = timedelta(minutes=10)
 
@@ -111,6 +112,23 @@ def init_distributed(*, tp_size: int, dp_size: int = 0) -> DistState:
 def destroy_distributed(state: DistState) -> None:
     if state.enabled:
         dist.destroy_process_group()
+
+
+def gather_lora_full_state_dict(student: torch.nn.Module) -> dict[str, torch.Tensor]:
+    """All-gather TP-sharded LoRA weights into full (replicated) tensors on CPU.
+
+    Collective: every TP rank must call this in lockstep. Keys come from the
+    identical model on all ranks, so the per-key full_tensor() calls stay aligned.
+    Non-DTensor params (replicated) pass through unchanged.
+    """
+    full: dict[str, torch.Tensor] = {}
+    for key, val in student.state_dict().items():
+        if "lora_" not in key:
+            continue
+        if isinstance(val, DTensor):
+            val = val.full_tensor()  # all-gather across the TP mesh
+        full[key] = val.detach().cpu()
+    return full
 
 
 def sync_gradients(params: list[torch.nn.Parameter], state: DistState) -> None:

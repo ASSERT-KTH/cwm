@@ -57,14 +57,14 @@ from cwm.rl.lib.impgen import ImpGen
 from evals.args import FastGenArgs, SetupArgs
 from evals.cruxeval.evaluate import check_correct, extract_answer_trace_full
 from evals.cruxeval.prompts import make_trace_full_prompt_tokens
-from evals.trace_analysis.ground_truth import ground_truth_trace
+from dataset.cruxeval.ground_truth import ground_truth_trace
 from evals.trace_analysis.metrics import (
     Table9Aggregate,
     aggregate,
     compute_trace_metrics,
     format_table9,
 )
-from evals.trace_analysis.trace_format import parse_generated_trace
+from dataset.cruxeval.trace_format import parse_generated_trace
 
 logger = logging.getLogger(__name__)
 

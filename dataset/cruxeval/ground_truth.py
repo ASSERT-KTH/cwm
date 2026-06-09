@@ -30,7 +30,7 @@ import sys
 from types import FrameType
 from typing import Any
 
-from evals.trace_analysis.trace_format import (
+from .trace_format import (
     DIFF_PLACEHOLDER,
     TraceEvent,
     TraceFrame,

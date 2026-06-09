@@ -22,13 +22,13 @@ import argparse
 import json
 from collections.abc import Callable
 
-from evals.trace_analysis.ground_truth import ground_truth_trace
+from dataset.cruxeval.ground_truth import ground_truth_trace
 from evals.trace_analysis.metrics import (
     aggregate,
     compute_trace_metrics,
     format_table9,
 )
-from evals.trace_analysis.trace_format import parse_generated_trace
+from dataset.cruxeval.trace_format import parse_generated_trace
 
 
 def _build_token_len(tokenizer_path: str | None) -> Callable[[str], int] | None:

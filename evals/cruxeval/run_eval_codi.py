@@ -4,16 +4,17 @@
 CRUXEval-O output prediction for a CODI-distilled CWM model.
 
 Predicts the *execution result* (CRUXEval-O pass@1), not the trace-quality
-metrics of ``evals.trace_analysis``. The CODI student was distilled on execution
-traces (``cwm.training.data`` uses the full-trace prompt), so it predicts the
-output by generating a trace with latent reasoning and reading the return value
-from the final RETURN frame (``extract_answer_trace_full``).
+metrics of ``evals.trace_analysis``. Supports the same four prompt modes as
+``evals.cruxeval.run_eval``: direct, reasoning, trace_full, trace_single_step.
+The CODI student was distilled on execution traces (``cwm.training.data`` uses
+the full-trace prompt), so ``trace_full`` is the native CODI eval mode.
 
 Loads a HuggingFace CWM base + a trained CODI LoRA adapter + ``thought_projector.pt``
 (``cwm.training.train`` output). Whenever the model emits ``<|line_sep|>`` it
 injects ``latent_steps`` continuous thoughts in place of the per-frame locals,
-mirroring the no-grad path of ``cwm.training.codi_streaming``. Greedy decoding,
-pass@1 (matches the greedy Table 9 reproduction config).
+mirroring the no-grad path of ``cwm.training.codi_streaming``. Sampling
+defaults match ``evals.cruxeval.run_eval`` (10 generations, temperature=0.6,
+top_p=0.95); set temperature<=0 for greedy decoding.
 
     torchrun --nproc_per_node=8 -m evals.cruxeval.run_eval_codi \\
         --adapter_dir /path/to/codi_qlora_..._output_dir \\
@@ -25,45 +26,129 @@ pass@1 (matches the greedy Table 9 reproduction config).
 from __future__ import annotations
 
 import argparse
+import fcntl
 import json
 import logging
 import os
+import time
+from datetime import timedelta
 from pathlib import Path
 
 import torch
 import torch.distributed as dist
 from datasets import load_dataset
 from torch import nn
-from tqdm import tqdm
 from transformers.cache_utils import DynamicCache
 
 from cwm.training.codi_config import default_codi_config_from_tokenizer
-from cwm.training.data import cruxeval_split
-from evals.cruxeval.evaluate import check_correct, extract_answer_trace_full
-from evals.cruxeval.prompts import _make_trace_context
+from dataset.cruxeval.dataset import cruxeval_split
+from evals.cruxeval.evaluate import (
+    check_correct,
+    extract_answer,
+    extract_answer_reasoning,
+    extract_answer_trace_full,
+    extract_answer_trace_single_step,
+)
+from evals.cruxeval.prompts import (
+    REASONING_SYSTEM_PROMPT,
+    _make_trace_context,
+    make_direct_output_prompt,
+)
 
 logger = logging.getLogger(__name__)
 
-# Full traces can be long; 8192 matches the cruxeval trace_full budget.
-_MAX_GEN = 8192
+_MODES = ("direct", "reasoning", "trace_full", "trace_single_step")
+
+# Visible-token budgets aligned with evals.cruxeval.run_eval.
+_MAX_GEN: dict[str, int] = {
+    "direct": 512,
+    "reasoning": 8192,
+    "trace_full": 8192,
+    "trace_single_step": 512,
+}
+
+
+def _token_id(tok, token: str) -> int:
+    token_id = tok.convert_tokens_to_ids(token)
+    if token_id is None or token_id == tok.unk_token_id:
+        encoded = tok.encode(token, add_special_tokens=False)
+        if len(encoded) != 1:
+            raise ValueError(f"{token!r} is not a single token: {encoded}")
+        token_id = encoded[0]
+    return int(token_id)
 
 
 def build_trace_full_prompt_ids(code: str, input_str: str, tok) -> list[int]:
     """HF-tokenizer port of ``make_trace_full_prompt_tokens`` (the seeded
     full-trace prompt the CODI student was trained on):
     ``[BOS][TRACE_CONTEXT_START]$CONTEXT[FRAME_SEP][CALL_SEP]{}
-    [ACTION_SEP]def main():\\n[FRAME_SEP]``.
+    [ACTION_SEP]def main():\n[FRAME_SEP]``.
     """
-    sid = tok.convert_tokens_to_ids
     context = _make_trace_context(code, input_str)
-    ids = [tok.bos_token_id, sid("<|trace_context_start|>")]
+    ids = [tok.bos_token_id, _token_id(tok, "<|trace_context_start|>")]
     ids += tok.encode(context, add_special_tokens=False)
-    ids += [sid("<|frame_sep|>"), sid("<|call_sep|>")]
+    ids += [_token_id(tok, "<|frame_sep|>"), _token_id(tok, "<|call_sep|>")]
     ids += tok.encode("{}", add_special_tokens=False)
-    ids += [sid("<|action_sep|>")]
+    ids += [_token_id(tok, "<|action_sep|>")]
     ids += tok.encode("def main():\n", add_special_tokens=False)
-    ids += [sid("<|frame_sep|>")]
+    ids += [_token_id(tok, "<|frame_sep|>")]
     return ids
+
+
+def build_trace_single_step_prompt_ids(code: str, input_str: str, tok) -> list[int]:
+    """HF-tokenizer port of ``make_trace_single_step_prompt_tokens``."""
+    ids = build_trace_full_prompt_ids(code, input_str, tok)
+    ids.append(_token_id(tok, "<|return_sep|>"))
+    return ids
+
+
+def build_reasoning_prompt_ids(code: str, input_str: str, tok) -> list[int]:
+    """HF-tokenizer port of ``make_reasoning_prompt_tokens``."""
+    base = make_direct_output_prompt(code, input_str)
+    assert base.endswith("[ANSWER]\n"), "unexpected prompt suffix"
+    user_msg = base[: -len("[ANSWER]\n")]
+
+    ids = [tok.bos_token_id]
+    ids += [_token_id(tok, "<|start_header_id|>")]
+    ids += tok.encode("system", add_special_tokens=False)
+    ids += [_token_id(tok, "<|end_header_id|>")]
+    ids += tok.encode("\n\n", add_special_tokens=False)
+    ids += tok.encode(REASONING_SYSTEM_PROMPT, add_special_tokens=False)
+    ids += [_token_id(tok, "<|eot_id|>")]
+    ids += [_token_id(tok, "<|start_header_id|>")]
+    ids += tok.encode("user", add_special_tokens=False)
+    ids += [_token_id(tok, "<|end_header_id|>")]
+    ids += tok.encode("\n\n", add_special_tokens=False)
+    ids += tok.encode(user_msg, add_special_tokens=False)
+    ids += [_token_id(tok, "<|eot_id|>")]
+    ids += [_token_id(tok, "<|start_header_id|>")]
+    ids += tok.encode("assistant", add_special_tokens=False)
+    ids += [_token_id(tok, "<|end_header_id|>")]
+    ids += tok.encode("\n\n", add_special_tokens=False)
+    ids += tok.encode("<think>\n", add_special_tokens=False)
+    return ids
+
+
+def build_prompt_ids(mode: str, code: str, input_str: str, tok) -> list[int]:
+    if mode == "direct":
+        ids = [] if tok.bos_token_id is None else [int(tok.bos_token_id)]
+        ids += tok.encode(make_direct_output_prompt(code, input_str), add_special_tokens=False)
+        return ids
+    if mode == "reasoning":
+        return build_reasoning_prompt_ids(code, input_str, tok)
+    if mode == "trace_full":
+        return build_trace_full_prompt_ids(code, input_str, tok)
+    if mode == "trace_single_step":
+        return build_trace_single_step_prompt_ids(code, input_str, tok)
+    raise ValueError(f"Unknown mode: {mode!r}")
+
+
+_EXTRACTORS = {
+    "direct": extract_answer,
+    "reasoning": extract_answer_reasoning,
+    "trace_full": extract_answer_trace_full,
+    "trace_single_step": extract_answer_trace_single_step,
+}
 
 
 def build_thought_projector(hidden_size: int, device, dtype) -> nn.Sequential:
@@ -78,89 +163,139 @@ def build_thought_projector(hidden_size: int, device, dtype) -> nn.Sequential:
 
 
 class CodiGenerator:
-    """Greedy autoregressive generation with CODI latent injection.
+    """Batched sampling generation with CODI latent injection.
 
-    Mirrors the no-grad path of ``cwm.training.codi_streaming`` (``_latent_step`` /
-    ``_latent_block_plain``): each model call appends one position to the KV cache;
-    on ``<|line_sep|>`` the per-frame locals are replaced by an optional
-    latent-start token, ``latent_steps`` projected continuous thoughts, and an
-    optional latent-end token. The next visible token (normally ``<|action_sep|>``)
-    is then decoded from the latent block's final logits.
+    Lock-step over the batch: every lane feeds exactly one embedding per forward
+    and advances one KV position, so all lanes stay cache-aligned. On
+    ``<|line_sep|>`` a lane's per-frame locals are replaced by a fixed feed
+    schedule (latent-start, ``latent_steps`` projected thoughts, latent-end)
+    before the next visible token is sampled -- mirroring the no-grad path of
+    ``cwm.training.codi_streaming``. Prompts are left-padded so lanes of unequal
+    length share one rectangular forward.
+
+    A "feed" is a token id, or ``None`` meaning "project the lane's previous
+    hidden state" (a latent thought).
     """
 
     def __init__(self, student, projector, cfg, device) -> None:
-        # student.base_model.model is the wrapped CwmForCausalLM (see codi_streaming).
-        self.causal_lm = student.base_model.model
+        assert cfg.latent_start_token_id is not None and cfg.latent_end_token_id is not None
+        self.lm = student.base_model.model  # CwmForCausalLM
         self.embed = student.get_input_embeddings()
         self.proj = projector
         self.cfg = cfg
         self.device = device
         self.dtype = self.embed.weight.dtype
-        self.hidden = self.embed.weight.shape[-1]
 
-    def _token_embed(self, token_id: int) -> torch.Tensor:
-        ids = torch.tensor([[token_id]], device=self.device)
-        return self.embed(ids)  # [1, 1, hidden]
+    def _schedule(self, token: int) -> list[int | None]:
+        """Feeds to run after sampling ``token`` to reach the next visible logits.
 
-    def _forward(self, inputs_embeds, cur_len, cache):
-        """One model call. Returns (last_hidden[1,L,h], next_logits[vocab], new_len)."""
-        L = inputs_embeds.shape[1]
-        pos = torch.arange(cur_len, cur_len + L, device=self.device).unsqueeze(0)
-        attn = torch.ones(1, cur_len + L, device=self.device, dtype=torch.long)
-        out = self.causal_lm.model(
-            inputs_embeds=inputs_embeds,
-            attention_mask=attn,
-            position_ids=pos,
-            past_key_values=cache,
-            use_cache=True,
-        )
-        last_hidden = out.last_hidden_state
-        logits = self.causal_lm.lm_head(last_hidden[:, -1])[0]  # [vocab]
-        return last_hidden, logits, cur_len + L
+        This mirrors ``_student_spans`` in training: ``<|line_sep|>`` remains a
+        visible token, the locals text up to ``<|action_sep|>`` is replaced by
+        latent-start/thoughts/latent-end, and only then do we sample the next
+        visible token.
+        """
+        c = self.cfg
+        if token == c.latent_span_start_token_id:
+            return [token, c.latent_start_token_id, *([None] * c.latent_steps), c.latent_end_token_id]
+        return [token]
 
-    def _latent_input(self, base: torch.Tensor) -> torch.Tensor:
-        """Project the previous step's last hidden state into an embedding slot."""
-        latent = self.proj(base.to(device=self.device, dtype=self.dtype))
-        return latent.view(1, 1, -1)
+    @staticmethod
+    def _endswith(tokens: list[int], suffix: list[int]) -> bool:
+        return bool(suffix) and len(tokens) >= len(suffix) and tokens[-len(suffix):] == suffix
+
+    @staticmethod
+    def _sample_next(logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
+        if temperature <= 0:
+            return logits.argmax(-1)
+        logits = logits / temperature
+        if top_p < 1.0:
+            sorted_logits, sorted_idx = torch.sort(logits, descending=True, dim=-1)
+            sorted_probs = torch.softmax(sorted_logits, dim=-1)
+            cumulative = sorted_probs.cumsum(dim=-1)
+            remove = cumulative > top_p
+            remove[..., 1:] = remove[..., :-1].clone()
+            remove[..., 0] = False
+            sorted_probs = sorted_probs.masked_fill(remove, 0.0)
+            sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            sampled = torch.multinomial(sorted_probs, num_samples=1).squeeze(-1)
+            return sorted_idx.gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
+        probs = torch.softmax(logits, dim=-1)
+        return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
     @torch.no_grad()
-    def generate(self, prompt_ids: list[int], max_gen: int, stop_ids: set[int]) -> list[int]:
-        cfg = self.cfg
+    def generate_batch(
+        self,
+        prompts: list[list[int]],
+        max_gen: int,
+        stop_ids: set[int],
+        stop_sequences: list[list[int]] | None = None,
+        temperature: float = 0.6,
+        top_p: float = 0.95,
+    ) -> list[list[int]]:
+        dev, B = self.device, len(prompts)
+        lens = [len(p) for p in prompts]
+        lmax = max(lens)
+
+        # left-pad: pad token 0 is masked at prefill and only fed to finished lanes.
+        ids = torch.zeros((B, lmax), dtype=torch.long, device=dev)
+        mask = torch.zeros((B, lmax), dtype=torch.long, device=dev)
+        for i, p in enumerate(prompts):
+            ids[i, lmax - lens[i]:] = torch.tensor(p, device=dev)
+            mask[i, lmax - lens[i]:] = 1
+        pos = (mask.cumsum(1) - 1).clamp(min=0)
+
         cache = DynamicCache()
-        prompt_embeds = self.embed(torch.tensor([prompt_ids], device=self.device))
-        _, logits, cur = self._forward(prompt_embeds, 0, cache)
+        hidden = self.lm.model(
+            inputs_embeds=self.embed(ids), attention_mask=mask,
+            position_ids=pos, past_key_values=cache, use_cache=True,
+        ).last_hidden_state[:, -1]
+        nextpos = torch.tensor(lens, device=dev)
 
-        generated: list[int] = []
-        for _ in range(max_gen):
-            token = int(logits.argmax(-1))
-            generated.append(token)
-            if token in stop_ids:
-                break
+        gen: list[list[int]] = [[] for _ in range(B)]
+        pending: list[list[int | None]] = [[] for _ in range(B)]
+        base = [hidden[i:i + 1] for i in range(B)]  # per-lane hidden for latent proj
+        done = [False] * B
+        stop_sequences = stop_sequences or []
 
-            if token == cfg.latent_span_start_token_id:
-                # Feed the line_sep token itself, then inject the latent block in
-                # place of the per-frame locals.
-                _, _, cur = self._forward(self._token_embed(token), cur, cache)
-                base = None
-                if cfg.latent_start_token_id is not None:
-                    lh, _, cur = self._forward(
-                        self._token_embed(cfg.latent_start_token_id), cur, cache
-                    )
-                    base = lh[:, -1]
-                for _ in range(cfg.latent_steps):
-                    if base is None:  # no latent-start token: seed from zeros
-                        base = torch.zeros(1, self.hidden, device=self.device, dtype=self.dtype)
-                    lh, logits, cur = self._forward(self._latent_input(base), cur, cache)
-                    base = lh[:, -1]
-                if cfg.latent_end_token_id is not None:
-                    _, logits, cur = self._forward(
-                        self._token_embed(cfg.latent_end_token_id), cur, cache
-                    )
-                # `logits` now predicts the next visible token (normally action_sep).
+        def take(i: int, token: int) -> None:
+            gen[i].append(token)
+            hit_stop_seq = any(self._endswith(gen[i], seq) for seq in stop_sequences)
+            if token in stop_ids or hit_stop_seq or len(gen[i]) >= max_gen:
+                done[i] = True
             else:
-                _, logits, cur = self._forward(self._token_embed(token), cur, cache)
+                pending[i] = self._schedule(token)
 
-        return generated
+        for i, t in enumerate(self._sample_next(self.lm.lm_head(hidden), temperature, top_p).tolist()):
+            take(i, t)
+
+        while not all(done):
+            feeds = torch.zeros(B, dtype=torch.long, device=dev)
+            latent, sample = [], []
+            for i in range(B):
+                if done[i]:
+                    continue
+                f = pending[i].pop(0)
+                latent.append(i) if f is None else feeds.__setitem__(i, f)
+                if not pending[i]:
+                    sample.append(i)
+            emb = self.embed(feeds).unsqueeze(1)
+            for i in latent:
+                emb[i, 0] = self.proj(base[i].to(self.dtype)).view(-1)
+
+            mask = torch.cat([mask, torch.ones(B, 1, dtype=torch.long, device=dev)], 1)
+            hidden = self.lm.model(
+                inputs_embeds=emb, attention_mask=mask,
+                position_ids=nextpos.unsqueeze(1), past_key_values=cache, use_cache=True,
+            ).last_hidden_state[:, -1]
+            nextpos = nextpos + 1
+            base = [hidden[i:i + 1] for i in range(B)]
+
+            if sample:
+                logits = self.lm.lm_head(hidden[sample])
+                toks = self._sample_next(logits, temperature, top_p).tolist()
+                for i, t in zip(sample, toks):
+                    take(i, t)
+        return gen
 
 
 def main() -> None:
@@ -169,20 +304,39 @@ def main() -> None:
     parser.add_argument("--base_model", default="model_weights/cwm_hf")
     parser.add_argument("--latent_steps", type=int, default=2, help="Must match training")
     parser.add_argument("--dump_dir", default="eval-codi-cruxeval")
+    parser.add_argument("--mode", default="trace_full", choices=_MODES)
     parser.add_argument("--n_samples", type=int, default=-1)
+    parser.add_argument("--n_generations", type=int, default=10)
+    parser.add_argument("--temperature", type=float, default=0.6)
+    parser.add_argument("--top_p", type=float, default=0.95)
+    parser.add_argument("--seed", type=int, default=42)
     parser.add_argument(
         "--data_split",
         default="val",
         choices=["train", "val", "all"],
         help="cruxeval_split: sweep on held-out 'val' (matches train data_split=train)",
     )
-    parser.add_argument("--max_gen", type=int, default=_MAX_GEN)
+    parser.add_argument("--max_gen", type=int, default=0, help="0 = mode default")
+    parser.add_argument("--batch_size", type=int, default=8, help="Lanes per lock-step forward.")
+    parser.add_argument(
+        "--dist_timeout_minutes",
+        type=int,
+        default=360,
+        help="Process-group timeout; long CODI generations can make ranks straggle.",
+    )
     parser.add_argument(
         "--device_map",
         default="auto",
         help="Only used in single-process mode; ignored under torchrun.",
     )
+    parser.add_argument(
+        "--load_4bit",
+        action="store_true",
+        help="NF4 4-bit base (~16GB, fits 40GB thin); matches QLoRA-trained base.",
+    )
     args = parser.parse_args()
+    if args.max_gen == 0:
+        args.max_gen = _MAX_GEN[args.mode]
 
     from peft import PeftModel
     from transformers import AutoModelForCausalLM, AutoTokenizer
@@ -193,18 +347,39 @@ def main() -> None:
     local_rank = int(os.environ.get("LOCAL_RANK", "0"))
     ddp = world_size > 1
     if ddp:
-        dist.init_process_group(backend="gloo")
+        dist.init_process_group(
+            backend="gloo",
+            timeout=timedelta(minutes=args.dist_timeout_minutes),
+        )
     is_rank_zero = rank == 0
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
 
     tok = AutoTokenizer.from_pretrained(args.base_model)
     eos_id = tok.eos_token_id
     eos_ids = eos_id if isinstance(eos_id, list) else [eos_id]
-    stop_ids = set(eos_ids)
+    stop_ids = {int(t) for t in eos_ids if t is not None}
+    stop_sequences: list[list[int]] = []
     eot = tok.convert_tokens_to_ids("<|end_of_text|>")
     if eot is not None and eot != tok.unk_token_id:
         stop_ids.add(int(eot))
+    if args.mode in ("direct", "reasoning"):
+        stop_sequences.append(tok.encode("[/ANSWER]", add_special_tokens=False))
+    elif args.mode == "trace_single_step":
+        stop_ids.add(_token_id(tok, "<|frame_sep|>"))
+    extract_fn = _EXTRACTORS[args.mode]
 
     load_kwargs: dict = {"dtype": torch.bfloat16, "attn_implementation": "sdpa"}
+    if args.load_4bit:
+        from transformers import BitsAndBytesConfig
+
+        load_kwargs["quantization_config"] = BitsAndBytesConfig(
+            load_in_4bit=True,
+            bnb_4bit_quant_type="nf4",
+            bnb_4bit_compute_dtype=torch.bfloat16,
+            bnb_4bit_use_double_quant=True,
+        )
     if ddp:
         device = torch.device(f"cuda:{local_rank}")
         torch.cuda.set_device(device)
@@ -231,49 +406,98 @@ def main() -> None:
     dataset = cruxeval_split(load_dataset("cruxeval-org/cruxeval", split="test"), args.data_split)
     if args.n_samples > 0:
         dataset = dataset[: args.n_samples]
-    my_samples = dataset[rank::world_size] if ddp else dataset
-    logger.info("rank %d/%d: %d samples", rank, world_size, len(my_samples))
 
     dump_path = Path(args.dump_dir)
     if is_rank_zero:
         dump_path.mkdir(parents=True, exist_ok=True)
+
+    # Build the global work list once on rank 0, then broadcast it so every rank
+    # agrees on the batch index -> samples mapping handed out by the shared counter.
+    if is_rank_zero:
+        kept = [
+            (len(prompt), s, prompt)
+            for s in dataset
+            for prompt in [build_prompt_ids(args.mode, s["code"], s["input"], tok)]
+        ]
+        kept.sort(key=lambda x: x[0])
+        batches = [kept[i:i + args.batch_size] for i in range(0, len(kept), args.batch_size)]
+    else:
+        batches = None
+    if ddp:
+        payload = [batches]
+        dist.broadcast_object_list(payload, src=0)
+        batches = payload[0]
+    logger.info("rank %d/%d: shared queue of %d batches", rank, world_size, len(batches))
+
+    # Shared atomic work queue: a counter file in the (shared) dump dir hands out
+    # the next unclaimed batch index. Idle ranks pull the next batch instead of
+    # running a fixed pre-assigned slice, so a rank that draws short samples keeps
+    # grabbing more rather than idling at the barrier.
+    counter_path = dump_path / "_batch_counter"
+    if is_rank_zero:
+        counter_path.write_text("0")
     if ddp:
         dist.barrier()
 
-    results: list[dict] = []
-    pbar = tqdm(total=len(my_samples), desc=f"CODI-CruxEval [rank={rank}]", position=rank)
-    for sample in my_samples:
-        code = sample["code"]
-        inp = sample["input"]
-        expected = sample["output"]
-
-        prompt_ids = build_trace_full_prompt_ids(code, inp, tok)
-        gen_ids = generator.generate(prompt_ids, args.max_gen, stop_ids)
-        generation = tok.decode(gen_ids, skip_special_tokens=False)
-
-        predicted = extract_answer_trace_full(generation, inp)
-        correct = (
-            check_correct(code, expected, predicted) if predicted is not None else False
-        )
-
-        results.append(
-            {
-                "id": sample["id"],
-                "code": code,
-                "input": inp,
-                "expected": expected,
-                "predicted": predicted,
-                "correct": correct,
-                "generation": generation,
-            }
-        )
-        pbar.update(1)
-    pbar.close()
-
     rank_results_path = dump_path / f"results_dp{rank}.jsonl"
-    with rank_results_path.open("w") as f:
-        for r in results:
-            f.write(json.dumps(r) + "\n")
+    if rank_results_path.exists():
+        rank_results_path.unlink()
+
+    with rank_results_path.open("a") as out:
+        def write(row: dict) -> None:
+            out.write(json.dumps(row) + "\n")
+            out.flush()
+            os.fsync(out.fileno())
+
+        n_done = 0
+        while True:
+            # Atomically read-and-increment the shared counter to claim a batch.
+            with counter_path.open("r+") as cf:
+                fcntl.flock(cf, fcntl.LOCK_EX)
+                b = int(cf.read() or "0")
+                if b >= len(batches):
+                    break  # closing cf releases the lock
+                cf.seek(0)
+                cf.truncate()
+                cf.write(str(b + 1))
+            # b + 1 batches have now been dispatched across all ranks -> total progress.
+            print(f"[dispatch {b + 1}/{len(batches)}] rank {rank}", flush=True)
+            batch = batches[b]
+            prompts = [prompt for _, _, prompt in batch]
+            t0 = time.perf_counter()
+            sample_gens: list[list[dict]] = [[] for _ in batch]
+            for _ in range(args.n_generations):
+                gens = generator.generate_batch(
+                    prompts,
+                    args.max_gen,
+                    stop_ids,
+                    stop_sequences,
+                    temperature=args.temperature,
+                    top_p=args.top_p,
+                )
+                for i, ((_sort_len, s, _prompt), g) in enumerate(zip(batch, gens)):
+                    generation = tok.decode(g, skip_special_tokens=False)
+                    predicted = extract_fn(generation, s["input"])
+                    correct = check_correct(s["code"], s["output"], predicted) if predicted is not None else False
+                    sample_gens[i].append({
+                        "generation": generation,
+                        "predicted": predicted,
+                        "correct": correct,
+                    })
+            dt = (time.perf_counter() - t0) / (len(batch) * args.n_generations)
+            for (_sort_len, s, _prompt), gens_for_sample in zip(batch, sample_gens):
+                n_correct = sum(g["correct"] for g in gens_for_sample)
+                write({
+                    "id": s["id"],
+                    "mode": args.mode,
+                    "expected": s["output"],
+                    "pass_at_1": n_correct / args.n_generations,
+                    "generations": gens_for_sample,
+                })
+            n_done += len(batch)
+            logger.info("rank %d claimed batch %d/%d (%d samples done) %.1fs/generation",
+                        rank, b, len(batches), n_done, dt)
+    logger.info("rank %d: %d samples scored across claimed batches", rank, n_done)
 
     if ddp:
         dist.barrier()
@@ -288,8 +512,11 @@ def main() -> None:
         id_to_idx = {s["id"]: i for i, s in enumerate(dataset)}
         all_results.sort(key=lambda r: id_to_idx.get(r["id"], 0))
 
-        pass_at_1 = sum(1.0 for r in all_results if r["correct"]) / len(all_results)
-        print(f"\nCRUXEval-O pass@1: {pass_at_1:.4f} (n={len(all_results)}, greedy)")
+        pass_at_1 = sum(r["pass_at_1"] for r in all_results) / len(all_results) if all_results else 0.0
+        print(
+            f"\nCRUXEval-O {args.mode} pass@1: {pass_at_1:.4f} "
+            f"(n={len(all_results)}, {args.n_generations} gens each)"
+        )
 
         with (dump_path / "results.jsonl").open("w") as f:
             for r in all_results:
@@ -298,8 +525,14 @@ def main() -> None:
         summary = {
             "pass_at_1": pass_at_1,
             "n_total": len(all_results),
-            "decoding": "greedy",
-            "mode": "trace_full",
+            "max_gen": args.max_gen,
+            "batch_size": args.batch_size,
+            "n_generations": args.n_generations,
+            "temperature": args.temperature,
+            "top_p": args.top_p,
+            "use_sampling": args.temperature > 0,
+            "seed": args.seed,
+            "mode": args.mode,
             "base_model": args.base_model,
             "adapter_dir": args.adapter_dir,
             "latent_steps": args.latent_steps,
@@ -308,6 +541,7 @@ def main() -> None:
         }
         with (dump_path / "summary.json").open("w") as f:
             json.dump(summary, f, indent=2)
+        counter_path.unlink(missing_ok=True)
         logger.info("Results written to %s", dump_path)
 
     if ddp:

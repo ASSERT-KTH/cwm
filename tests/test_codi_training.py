@@ -52,8 +52,8 @@ def test_codi_loss_backprops_only_to_student() -> None:
 
     output = model(input_ids, labels=labels, attention_mask=attention_mask)
 
-    assert output.kd_positions.shape == (2, 3)
-    assert output.metrics["num_kd_positions"].item() == 2
+    batch_idx, _ = model._teacher_positions(input_ids, labels, attention_mask)
+    assert batch_idx.numel() == 2  # one valid latent_span_end per row
     assert output.loss.requires_grad
 
     output.loss.backward()
@@ -87,13 +87,13 @@ def test_latent_span_replaces_inner_text() -> None:
     labels = input_ids.clone()
     batch_idx, teacher_pos = model._teacher_positions(input_ids, labels, attention_mask)
 
-    _, _, _, student_pos, _, student_tokens = streaming_student_outputs(
+    _, _, student_kd, _, student_tokens = streaming_student_outputs(
         model, input_ids, labels, attention_mask, batch_idx, teacher_pos
     )
 
     assert teacher_pos.tolist() == [4]
-    assert student_pos.tolist() == [6]
-    assert student_tokens == 8
+    assert student_kd.row_col[:, 1].tolist() == [4]  # KD registered at the teacher col
+    assert student_tokens == 8  # 6 input tokens + injected latents (start/2 steps/end)
 
 
 def test_batched_streaming_matches_per_row() -> None:
@@ -112,7 +112,7 @@ def test_batched_streaming_matches_per_row() -> None:
     labels = input_ids.masked_fill(~attention_mask.bool(), config.ignore_index)
 
     batch_idx, teacher_pos = model._teacher_positions(input_ids, labels, attention_mask)
-    _, _, kd_batched, spos_batched, _, _ = streaming_student_outputs(
+    _, _, kd_batched, _, _ = streaming_student_outputs(
         model, input_ids, labels, attention_mask, batch_idx, teacher_pos
     )
 
@@ -123,18 +123,18 @@ def test_batched_streaming_matches_per_row() -> None:
         ids, am = input_ids[b : b + 1], attention_mask[b : b + 1]
         lab = labels[b : b + 1]
         bi, tp = model._teacher_positions(ids, lab, am)
-        _, _, kd_row, spos_row, _, _ = streaming_student_outputs(
+        _, _, kd_row, _, _ = streaming_student_outputs(
             model, ids, lab, am, bi, tp
         )
         if ref_layers is None:
-            ref_layers = [[] for _ in kd_row]
-        for layer, vec in enumerate(kd_row):
+            ref_layers = [[] for _ in kd_row.vecs]
+        for layer, vec in enumerate(kd_row.vecs):
             ref_layers[layer].append(vec)
-        ref_spos.extend(spos_row.tolist())
+        ref_spos.extend(kd_row.row_col[:, 1].tolist())
 
-    assert spos_batched.tolist() == ref_spos
-    assert len(kd_batched) == len(ref_layers)
-    for batched_layer, ref_parts in zip(kd_batched, ref_layers, strict=True):
+    assert kd_batched.row_col[:, 1].tolist() == ref_spos
+    assert len(kd_batched.vecs) == len(ref_layers)
+    for batched_layer, ref_parts in zip(kd_batched.vecs, ref_layers, strict=True):
         torch.testing.assert_close(batched_layer, torch.cat(ref_parts), atol=1e-4, rtol=1e-4)
 
 
@@ -157,9 +157,9 @@ def test_batched_lm_loss_invariant_to_duplication() -> None:
 
 
 def test_checkpoint_single_call_matches_eager() -> None:
-    # No <|line_sep|> -> a single student call, no latent block. The grad-enabled
-    # (always-on) checkpointed path must give the same loss as the eager no_grad
-    # plain-cache path, and grads must reach the LoRA params.
+    # No <|line_sep|> -> a single student call, no latent block. The forward loss
+    # under no_grad (checkpoint runs without recompute) must match the grad-enabled
+    # forward+backward loss, and grads must reach the LoRA params.
     torch.manual_seed(0)
     model, config = _codi_model()
     model.eval()
@@ -168,7 +168,7 @@ def test_checkpoint_single_call_matches_eager() -> None:
     attention_mask = torch.ones_like(input_ids)
     labels = input_ids.clone()
 
-    with torch.no_grad():  # grad disabled -> eager plain-cache path (no checkpoint)
+    with torch.no_grad():  # grad disabled -> checkpoint runs forward without recompute
         ref_loss = model(input_ids, labels=labels, attention_mask=attention_mask).loss
 
     model.zero_grad(set_to_none=True)
@@ -183,8 +183,8 @@ def test_checkpoint_single_call_matches_eager() -> None:
 def test_checkpoint_preserves_latent_gradient() -> None:
     # With <|line_sep|> + latents the latent gradient reaches the loss only via
     # later tokens attending to the injected latents through the KV cache. The
-    # block-checkpointed path rebuilds the cache without detaching it, so the loss
-    # matches the eager path and grads reach the thought projector.
+    # block checkpoint rebuilds the cache without detaching it, so the no_grad
+    # forward loss matches and grads reach the thought projector.
     torch.manual_seed(0)
     config = CodiConfig(
         latent_span_start_token_id=10,
@@ -200,7 +200,7 @@ def test_checkpoint_preserves_latent_gradient() -> None:
     attention_mask = torch.ones_like(input_ids)
     labels = input_ids.clone()
 
-    with torch.no_grad():  # grad disabled -> eager plain-cache path (no checkpoint)
+    with torch.no_grad():  # grad disabled -> checkpoint runs forward without recompute
         ref_loss = model(input_ids, labels=labels, attention_mask=attention_mask).loss
 
     model.zero_grad(set_to_none=True)
@@ -229,10 +229,10 @@ def test_kd_layers_subset_restricts_distilled_layers() -> None:
     attention_mask = torch.ones_like(input_ids)
     labels = input_ids.clone()
 
-    _, _, kd, _, _, _ = streaming_student_outputs(
+    _, _, kd, _, _ = streaming_student_outputs(
         model, input_ids, labels, attention_mask, *model._teacher_positions(input_ids, labels, attention_mask)
     )
-    assert len(kd) == 1  # _tiny_model has 2 layers; only the last is distilled
+    assert len(kd.vecs) == 1  # _tiny_model has 2 layers; only the last is distilled
     out = model(input_ids, labels=labels, attention_mask=attention_mask)
     assert torch.isfinite(out.kd_loss)
 
@@ -255,9 +255,10 @@ def test_codi_kd_positions_ignore_masked_prompt_tokens() -> None:
     labels = input_ids.clone()
     labels[:, :4] = config.ignore_index
 
-    output = model(input_ids, labels=labels, attention_mask=attention_mask)
-
-    assert output.kd_positions.tolist() == [[0, 5, 7]]
+    # Two token-13 markers (idx 1, 5); the masked-prompt one at idx 1 is dropped.
+    batch_idx, teacher_pos = model._teacher_positions(input_ids, labels, attention_mask)
+    assert batch_idx.tolist() == [0]
+    assert teacher_pos.tolist() == [5]
 
 
 def test_token_budget_sampler_allows_variable_rows_across_dp_ranks() -> None:

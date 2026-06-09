@@ -9,6 +9,8 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
+from dataset.cruxeval.ground_truth import make_trace_context as _make_trace_context
+
 if TYPE_CHECKING:
     from cwm.text.tokenizers import CWMInstructTokenizer
 
@@ -49,11 +51,6 @@ assert f({input}) == ??
 [/PYTHON]
 [ANSWER]
 """
-
-
-def _make_trace_context(code: str, input_str: str) -> str:
-    """Build the Python source context for trace prediction."""
-    return f"\n{code}\ndef main():  # << START_OF_TRACE\n    return f({input_str})\n"
 
 
 def make_trace_full_prompt_tokens(

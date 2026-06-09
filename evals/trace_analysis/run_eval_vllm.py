@@ -21,13 +21,13 @@ from datasets import load_dataset
 from transformers import AutoTokenizer
 
 from evals.cruxeval.evaluate import check_correct, extract_answer_trace_full
-from evals.trace_analysis.ground_truth import ground_truth_trace
+from dataset.cruxeval.ground_truth import ground_truth_trace
 from evals.trace_analysis.metrics import compute_trace_metrics, format_table9
 from evals.trace_analysis.run_eval_hf import (
     _aggregate_results,
     build_trace_full_prompt_ids,
 )
-from evals.trace_analysis.trace_format import parse_generated_trace
+from dataset.cruxeval.trace_format import parse_generated_trace
 
 logger = logging.getLogger(__name__)
 

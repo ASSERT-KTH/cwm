@@ -3,6 +3,7 @@
 from dataclasses import dataclass
 from typing import Literal
 
+import torch
 from torch import nn
 
 
@@ -16,7 +17,6 @@ class CodiConfig:
     lm_loss_weight: float = 1.0
     kd_loss_weight: float = 1.0
     ignore_index: int = -100
-    distill_offset: int = 0
     kd_loss: Literal["l1", "smooth_l1", "mse"] = "l1"
     normalize_kd_by_teacher_std: bool = True
     kd_eps: float = 1e-6
@@ -41,8 +41,6 @@ class CodiConfig:
             raise ValueError("lm_loss_weight must be non-negative")
         if self.kd_loss_weight < 0:
             raise ValueError("kd_loss_weight must be non-negative")
-        if self.distill_offset < 0:
-            raise ValueError("distill_offset must be non-negative")
         if self.lora_r <= 0:
             raise ValueError("lora_r must be positive")
         if self.lora_alpha <= 0:
@@ -51,13 +49,13 @@ class CodiConfig:
             raise ValueError("lora_dropout must be non-negative")
 
 
-def select_kd_layers(hidden_states, kd_layers: tuple[int, ...] | None):
-    """Per-layer hidden states to distill (drops the embedding layer at index 0).
+@dataclass
+class KdVecs:
+    row_col: torch.Tensor       # [N, 2] — (batch_row, teacher_col) for each KD position
+    vecs: list[torch.Tensor]    # list[Tensor[N, H]], one per KD layer
 
-    ``kd_layers`` selects a subset by index (negatives allowed, e.g. ``(-1,)`` for
-    last layer only); ``None`` keeps every transformer layer. Teacher and student
-    must pass the same ``kd_layers`` so the per-layer KD lists line up.
-    """
+
+def select_kd_layers(hidden_states, kd_layers: tuple[int, ...] | None):
     layers = hidden_states[1:]
     if kd_layers is None:
         return layers
