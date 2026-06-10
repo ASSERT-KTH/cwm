@@ -14,8 +14,10 @@ class CodiConfig:
     latent_steps: int
     latent_start_token_id: int | None = None
     latent_end_token_id: int | None = None
-    lm_loss_weight: float = 1.0
-    kd_loss_weight: float = 1.0
+    # CODI three-term loss: alpha*L_teacher + beta*L_student + gamma*L_KD.
+    teacher_loss_weight: float = 1.0  # alpha: explicit-CoT CE on the full trace
+    lm_loss_weight: float = 1.0       # beta: implicit-CoT (latent) student CE
+    kd_loss_weight: float = 1.0       # gamma: hidden-state distillation
     ignore_index: int = -100
     kd_loss: Literal["l1", "smooth_l1", "mse"] = "l1"
     normalize_kd_by_teacher_std: bool = True
@@ -37,6 +39,8 @@ class CodiConfig:
     def __post_init__(self) -> None:
         if self.latent_steps < 0:
             raise ValueError("latent_steps must be non-negative")
+        if self.teacher_loss_weight < 0:
+            raise ValueError("teacher_loss_weight must be non-negative")
         if self.lm_loss_weight < 0:
             raise ValueError("lm_loss_weight must be non-negative")
         if self.kd_loss_weight < 0:
@@ -62,6 +66,15 @@ def select_kd_layers(hidden_states, kd_layers: tuple[int, ...] | None):
     return tuple(layers[i] for i in kd_layers)
 
 
+def kd_layers_are_last_only(
+    kd_layers: tuple[int, ...] | None, num_hidden_layers: int
+) -> bool:
+    return kd_layers is not None and len(kd_layers) == 1 and kd_layers[0] in (
+        -1,
+        num_hidden_layers - 1,
+    )
+
+
 def cwm_token_id(tokenizer, token: str) -> int:
     token_id = tokenizer.convert_tokens_to_ids(token)
     if token_id is not None and token_id != tokenizer.unk_token_id:
@@ -78,6 +91,7 @@ def default_codi_config_from_tokenizer(
     *,
     latent_steps: int,
     kd_layers: tuple[int, ...] | None = (-1,),
+    teacher_loss_weight: float = 1.0,
     lm_loss_weight: float = 1.0,
     kd_loss_weight: float = 1.0,
 ) -> CodiConfig:
@@ -88,6 +102,7 @@ def default_codi_config_from_tokenizer(
         latent_end_token_id=cwm_token_id(tokenizer, "<|reasoning_thinking_end|>"),
         latent_steps=latent_steps,
         kd_layers=kd_layers,
+        teacher_loss_weight=teacher_loss_weight,
         lm_loss_weight=lm_loss_weight,
         kd_loss_weight=kd_loss_weight,
     )

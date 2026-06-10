@@ -1,18 +1,24 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
-from contextlib import contextmanager
 from dataclasses import dataclass
 import torch
 import torch.nn.functional as F
 from torch import nn
 
-from cwm.training.codi_config import CodiConfig, KdVecs, apply_lora, select_kd_layers
+from cwm.training.codi_config import (
+    CodiConfig,
+    KdVecs,
+    apply_lora,
+    kd_layers_are_last_only,
+    select_kd_layers,
+)
 from cwm.training.codi_streaming import streaming_student_outputs
 
 
 @dataclass
 class CodiOutput:
     loss: torch.Tensor
+    teacher_loss: torch.Tensor
     lm_loss: torch.Tensor
     kd_loss: torch.Tensor
     metrics: dict[str, torch.Tensor]
@@ -104,67 +110,133 @@ class CodiModel(nn.Module):
         ]
         return torch.stack(losses).mean()
 
-    @contextmanager
-    def _teacher_mode(self):
-        """Run the original model (without adapter) without gradients as the teacher."""
-        disable_adapter = getattr(self.student, "disable_adapter", None)
-        if disable_adapter is None:
-            raise RuntimeError("CodiModel needs a PEFT student with disable_adapter().")
-        was_training = self.student.training
-        self.student.eval()
-        try:
-            with torch.no_grad(), disable_adapter():
-                yield
-        finally:
-            self.student.train(was_training)
+    def _teacher_row_forward(self, ids: torch.Tensor, row_labels: torch.Tensor):
+        """Full-sequence teacher forward for one row (gradient-checkpointed).
 
-    def _teacher_kd_vecs(
+        Returns the row's summed teacher CE (with grad) plus the per-KD-layer
+        hidden states detached (KD targets get stop-gradient, CODI's sg[.]).
+        """
+        causal_lm = self.student.base_model.model
+        last_kd_layer_only = kd_layers_are_last_only(
+            self.config.kd_layers, causal_lm.config.num_hidden_layers
+        )
+        out = causal_lm.model(
+            input_ids=ids,
+            output_hidden_states=not last_kd_layer_only,
+            use_cache=False,
+        )
+        logits = causal_lm.lm_head(out.last_hidden_state)
+        # Next-token CE over the full explicit trace (L_teacher).
+        loss = F.cross_entropy(
+            logits[0, :-1],
+            row_labels[1:],
+            ignore_index=self.config.ignore_index,
+            reduction="sum",
+        )
+        kd_hidden_states = (
+            (out.last_hidden_state,)
+            if last_kd_layer_only
+            else select_kd_layers(out.hidden_states, self.config.kd_layers)
+        )
+        return (loss, *(h.detach() for h in kd_hidden_states))
+
+    def _teacher_forward(
         self,
         input_ids: torch.Tensor,
+        labels: torch.Tensor,
         attention_mask: torch.Tensor,
         batch_idx: torch.Tensor,
         teacher_pos: torch.Tensor,
-    ) -> KdVecs | None:
-        if batch_idx.numel() == 0:
-            return None
+    ) -> tuple[torch.Tensor, torch.Tensor, KdVecs | None]:
+        """CODI teacher task: the SHARED model reads the explicit trace.
 
-        backbone = self.student.base_model.model.model
+        Runs WITH gradients (teacher CE co-trains the same weights as the
+        student); only the KD target hidden states are detached. Returns
+        (teacher_loss_sum, teacher_token_count, teacher_kd).
+        """
         num_kd_layers = (
             len(self.config.kd_layers)
             if self.config.kd_layers is not None
-            else backbone.config.num_hidden_layers
+            else self.student.base_model.model.config.num_hidden_layers
         )
         collected_per_layer: list[list[torch.Tensor]] = [
             [] for _ in range(num_kd_layers)
         ]
+        loss_sum = self.input_embeddings.weight.sum() * 0.0
+        token_count = torch.zeros((), device=input_ids.device, dtype=torch.long)
 
-        for row in range(input_ids.shape[0]):
-            sample_kd_mask = batch_idx == row
-            if not sample_kd_mask.any():
-                continue
+        # Per-layer checkpointing: backward recomputes one decoder layer at a
+        # time (peak ~1 layer, not 64). Off after the loop — it forces
+        # use_cache=False, which would break the student's KV streaming.
+        backbone = self.student.base_model.model.model
+        backbone.gradient_checkpointing_enable(
+            gradient_checkpointing_kwargs={"use_reentrant": False}
+        )
+        try:
+            for row in range(input_ids.shape[0]):
+                # Right-padded, sum of attention_mask = number of real tokens.
+                real_token_count = int(attention_mask[row].sum().item())
+                ids = input_ids[row : row + 1, :real_token_count]
+                row_labels = labels[row, :real_token_count]
+                loss, *kd_hidden_states = self._teacher_row_forward(ids, row_labels)
+                loss_sum = loss_sum + loss
+                token_count += (row_labels[1:] != self.config.ignore_index).sum()
 
-            # Right-padded, sum of attention_mask = number of real tokens.
-            real_token_count = int(attention_mask[row].sum().item())
-            backbone_output = backbone(
-                input_ids=input_ids[row : row + 1, :real_token_count],
-                output_hidden_states=True,
-                use_cache=False,
+                sample_kd_mask = batch_idx == row
+                if not sample_kd_mask.any():
+                    continue
+                kd_token_positions = teacher_pos[sample_kd_mask]
+                for layer_index, layer_hidden_state in enumerate(kd_hidden_states):
+                    collected_per_layer[layer_index].append(
+                        layer_hidden_state[0, kd_token_positions]
+                    )
+        finally:
+            backbone.gradient_checkpointing_disable()
+
+        teacher_kd = None
+        if batch_idx.numel() > 0:
+            vecs = [torch.cat(chunks) for chunks in collected_per_layer]
+            teacher_kd = KdVecs(
+                row_col=torch.stack([batch_idx, teacher_pos], dim=1), vecs=vecs
             )
+        return loss_sum, token_count, teacher_kd
 
-            kd_hidden_states = select_kd_layers(
-                backbone_output.hidden_states, self.config.kd_layers
-            )
-            kd_token_positions = teacher_pos[sample_kd_mask]
+    def teacher_step(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        labels: torch.Tensor,
+        attention_mask: torch.Tensor,
+    ) -> tuple[torch.Tensor, KdVecs | None, tuple[torch.Tensor, torch.Tensor]]:
+        """Teacher task (explicit trace, WITH grad); KD target detached. Split from
+        the student so the caller can backward and free the teacher graph BEFORE the
+        student forward, keeping peak VRAM = max(teacher, student) not their sum."""
+        batch_idx, teacher_pos = self._teacher_positions(
+            input_ids, labels, attention_mask
+        )
+        teacher_sum, teacher_count, teacher_kd = self._teacher_forward(
+            input_ids, labels, attention_mask, batch_idx, teacher_pos
+        )
+        teacher_loss = teacher_sum / teacher_count.clamp(min=1)
+        return teacher_loss, teacher_kd, (batch_idx, teacher_pos)
 
-            for layer_index, layer_hidden_state in enumerate(kd_hidden_states):
-                collected_per_layer[layer_index].append(
-                    layer_hidden_state[0, kd_token_positions]
-                )
-
-        vecs = [
-            torch.cat(layer_chunks).detach() for layer_chunks in collected_per_layer
-        ]
-        return KdVecs(row_col=torch.stack([batch_idx, teacher_pos], dim=1), vecs=vecs)
+    def student_step(
+        self,
+        input_ids: torch.Tensor,
+        *,
+        labels: torch.Tensor,
+        attention_mask: torch.Tensor,
+        teacher_kd: KdVecs | None,
+        positions: tuple[torch.Tensor, torch.Tensor],
+    ) -> tuple[torch.Tensor, torch.Tensor, int, int]:
+        """Student task (latent CoT streaming); KD aligned to the detached teacher."""
+        batch_idx, teacher_pos = positions
+        lm_sum, lm_count, student_kd, calls, tokens = streaming_student_outputs(
+            self, input_ids, labels, attention_mask, batch_idx, teacher_pos
+        )
+        lm_loss = lm_sum / lm_count.clamp(min=1)
+        kd_loss = self._kd_loss(student_kd, teacher_kd, lm_loss)
+        return lm_loss, kd_loss, calls, tokens
 
     def forward(
         self,
@@ -173,52 +245,28 @@ class CodiModel(nn.Module):
         labels: torch.Tensor,
         attention_mask: torch.Tensor,
     ) -> CodiOutput:
-        batch_idx, teacher_pos = self._teacher_positions(
-            input_ids, labels, attention_mask
+        teacher_loss, teacher_kd, positions = self.teacher_step(
+            input_ids, labels=labels, attention_mask=attention_mask
         )
-
-        # student forward, with latent reasoning injection.
-        (
-            lm_sum,
-            lm_count,
-            student_kd,
-            student_model_calls,
-            student_tokens,
-        ) = streaming_student_outputs(
-            self,
+        lm_loss, kd_loss, calls, tokens = self.student_step(
             input_ids,
-            labels,
-            attention_mask,
-            batch_idx,
-            teacher_pos,
+            labels=labels,
+            attention_mask=attention_mask,
+            teacher_kd=teacher_kd,
+            positions=positions,
         )
-
-        # teacher forward, without adapter and gradient tracking.
-        with self._teacher_mode():
-            teacher_kd = self._teacher_kd_vecs(
-                input_ids, attention_mask, batch_idx, teacher_pos
-            )
-
-        lm_loss = lm_sum / lm_count.clamp(min=1)
-        kd_loss = self._kd_loss(student_kd, teacher_kd, lm_loss)
-
+        # CODI: L = alpha*L_teacher + beta*L_student + gamma*L_KD.
         loss = (
-            self.config.lm_loss_weight * lm_loss + self.config.kd_loss_weight * kd_loss
+            self.config.teacher_loss_weight * teacher_loss
+            + self.config.lm_loss_weight * lm_loss
+            + self.config.kd_loss_weight * kd_loss
         )
-
         metrics = {
             "loss": loss.detach(),
+            "teacher_loss": teacher_loss.detach(),
             "lm_loss": lm_loss.detach(),
             "kd_loss": kd_loss.detach(),
-            "student_model_calls": torch.tensor(
-                student_model_calls, device=input_ids.device
-            ),
-            "student_tokens": torch.tensor(student_tokens, device=input_ids.device),
+            "student_model_calls": torch.tensor(calls, device=input_ids.device),
+            "student_tokens": torch.tensor(tokens, device=input_ids.device),
         }
-
-        return CodiOutput(
-            loss=loss,
-            lm_loss=lm_loss,
-            kd_loss=kd_loss,
-            metrics=metrics,
-        )
+        return CodiOutput(loss, teacher_loss, lm_loss, kd_loss, metrics)

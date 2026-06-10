@@ -37,8 +37,9 @@ class TrainArgs:
     use_thought_projector: bool = True
     qlora: bool = False  # base + teacher in 4-bit NF4 (bitsandbytes)
     lr: float = 1e-4
-    lm_loss_weight: float = 1.0
-    kd_loss_weight: float = 1.0
+    teacher_loss_weight: float = 1.0  # alpha: explicit-CoT teacher CE
+    lm_loss_weight: float = 1.0       # beta: implicit-CoT student CE
+    kd_loss_weight: float = 1.0       # gamma: hidden-state distillation
     epochs: int = 1
     batch_size: int = 1
     grad_accum_steps: int = 1
@@ -107,7 +108,7 @@ def _setup_wandb(args: TrainArgs, dist_state):
         name = (
             f"codi_{'qlora' if args.qlora else 'full'}_lat{args.latent_steps}_kd{kd}"
             f"_bs{args.batch_size}x{args.grad_accum_steps}_lr{args.lr:g}"
-            f"_lmw{args.lm_loss_weight:g}_kdw{args.kd_loss_weight:g}"
+            f"_tw{args.teacher_loss_weight:g}_lmw{args.lm_loss_weight:g}_kdw{args.kd_loss_weight:g}"
             f"_seq{args.max_seq_len}_mbt{args.max_batch_tokens}"
             f"_ep{args.epochs}_dp{dist_state.dp_size}_tp{dist_state.tp_size}"
             f"_proj{int(args.use_thought_projector)}_seed{args.seed}"
@@ -153,11 +154,13 @@ _TIMING_KEYS = (
     "optimizer",
     "student_calls",
     "student_tokens",
+    "teacher_peak",  # GB, max over teacher fwd+bwd
+    "student_peak",  # GB, max over student fwd+bwd (teacher graph already freed)
 )
 
 
 def _new_window() -> dict:
-    return {"loss": 0.0, "lm": 0.0, "kd": 0.0}
+    return {"loss": 0.0, "teacher": 0.0, "lm": 0.0, "kd": 0.0}
 
 
 def _new_timing() -> dict:
@@ -195,10 +198,11 @@ class _Trainer:
             + timing["backward"]
             + timing["optimizer"]
         )
+        device = self.dist_state.device
         logger.info(
             "timing step %d total=%.3fs data=%.3f h2d=%.3f "
             "forward=%.3f backward=%.3f optimizer=%.3f student_calls=%.0f "
-            "student_tokens=%.0f accum_batches=%d",
+            "student_tokens=%.0f teacher_peak=%.1fGB student_peak=%.1fGB accum_batches=%d",
             self.step,
             total,
             timing["data"],
@@ -208,6 +212,8 @@ class _Trainer:
             timing["optimizer"],
             timing["student_calls"],
             timing["student_tokens"],
+            timing["teacher_peak"],
+            timing["student_peak"],
             accum_batches,
         )
 
@@ -230,24 +236,32 @@ class _Trainer:
         self.step += 1
 
         metrics = torch.tensor(
-            [window["loss"], window["lm"], window["kd"], float(accum_batches)],
+            [
+                window["loss"],
+                window["teacher"],
+                window["lm"],
+                window["kd"],
+                float(accum_batches),
+            ],
             device=self.device,
             dtype=torch.float32,
         )
         if dist_state.dp_enabled:
             dist.all_reduce(metrics, op=dist.ReduceOp.SUM, group=dist_state.dp_group)
-        total_batches = float(metrics[3].item())
+        total_batches = float(metrics[4].item())
         loss = float(metrics[0].item()) / total_batches
-        lm = float(metrics[1].item()) / total_batches
-        kd = float(metrics[2].item()) / total_batches
+        teacher = float(metrics[1].item()) / total_batches
+        lm = float(metrics[2].item()) / total_batches
+        kd = float(metrics[3].item()) / total_batches
         lr = self.optimizer.param_groups[0]["lr"]
 
         if dist_state.is_rank_zero:
             logger.info(
-                "epoch %d step %d loss=%.4f lm=%.4f kd=%.4f grad_norm=%.3f",
+                "epoch %d step %d loss=%.4f teacher=%.4f lm=%.4f kd=%.4f grad_norm=%.3f",
                 epoch,
                 self.step,
                 loss,
+                teacher,
                 lm,
                 kd,
                 float(grad_norm),
@@ -256,6 +270,7 @@ class _Trainer:
                 self.wandb_run.log(
                     {
                         "loss": loss,
+                        "teacher_loss": teacher,
                         "lm_loss": lm,
                         "kd_loss": kd,
                         "grad_norm": float(grad_norm),
@@ -296,25 +311,61 @@ class _Trainer:
                     or batch_idx + 1 == num_batches
                 )
 
-                start = self._stamp()
-                out = self.model(
+                ga = args.grad_accum_steps
+                cuda = self.device.type == "cuda"
+                # Teacher phase: forward + backward. Freeing its graph here, before
+                # the student forward, keeps peak VRAM at max(teacher, student) not sum.
+                if cuda:
+                    torch.cuda.reset_peak_memory_stats(self.device)
+                t0 = self._stamp()
+                teacher_loss, teacher_kd, positions = self.model.teacher_step(
                     batch["input_ids"],
                     labels=batch["labels"],
                     attention_mask=batch["attention_mask"],
                 )
-                timing["forward"] += self._stamp() - start
+                t1 = self._stamp()
+                if teacher_loss.requires_grad:
+                    (args.teacher_loss_weight * teacher_loss / ga).backward()
+                # Student phase: forward + backward (teacher graph already freed).
+                # Reset peak between phases to attribute the bottleneck to one phase.
+                t2 = self._stamp()
+                if cuda:
+                    timing["teacher_peak"] = max(
+                        timing["teacher_peak"],
+                        torch.cuda.max_memory_allocated(self.device) / 1024**3,
+                    )
+                    torch.cuda.reset_peak_memory_stats(self.device)
+                lm_loss, kd_loss, s_calls, s_tokens = self.model.student_step(
+                    batch["input_ids"],
+                    labels=batch["labels"],
+                    attention_mask=batch["attention_mask"],
+                    teacher_kd=teacher_kd,
+                    positions=positions,
+                )
+                t3 = self._stamp()
+                ((args.lm_loss_weight * lm_loss + args.kd_loss_weight * kd_loss) / ga).backward()
+                t4 = self._stamp()
+                if cuda:
+                    timing["student_peak"] = max(
+                        timing["student_peak"],
+                        torch.cuda.max_memory_allocated(self.device) / 1024**3,
+                    )
+                timing["forward"] += (t1 - t0) + (t3 - t2)
+                timing["backward"] += (t2 - t1) + (t4 - t3)
                 if self.collect_timing:
-                    timing["student_calls"] += out.metrics["student_model_calls"].item()
-                    timing["student_tokens"] += out.metrics["student_tokens"].item()
-
-                start = self._stamp()
-                (out.loss / args.grad_accum_steps).backward()
-                timing["backward"] += self._stamp() - start
+                    timing["student_calls"] += s_calls
+                    timing["student_tokens"] += s_tokens
 
                 accum_batches += 1
-                window["loss"] += out.metrics["loss"].item()
-                window["lm"] += out.lm_loss.item()
-                window["kd"] += out.kd_loss.item()
+                t, l, k = teacher_loss.item(), lm_loss.item(), kd_loss.item()
+                window["loss"] += (
+                    args.teacher_loss_weight * t
+                    + args.lm_loss_weight * l
+                    + args.kd_loss_weight * k
+                )
+                window["teacher"] += t
+                window["lm"] += l
+                window["kd"] += k
 
                 if will_step:
                     self._optimizer_step(epoch, window, accum_batches, timing)
@@ -349,6 +400,7 @@ def main(args: TrainArgs) -> None:
             tokenizer,
             latent_steps=args.latent_steps,
             kd_layers=tuple(args.kd_layers) if args.kd_layers else None,
+            teacher_loss_weight=args.teacher_loss_weight,
             lm_loss_weight=args.lm_loss_weight,
             kd_loss_weight=args.kd_loss_weight,
         )

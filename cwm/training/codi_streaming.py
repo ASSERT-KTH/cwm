@@ -8,7 +8,7 @@ import torch.nn.functional as F
 from torch.utils.checkpoint import checkpoint
 from transformers.cache_utils import DynamicCache
 
-from cwm.training.codi_config import KdVecs, select_kd_layers
+from cwm.training.codi_config import KdVecs, kd_layers_are_last_only, select_kd_layers
 
 HiddenRequest = Literal["none", "all_layers", "last_layer"]
 
@@ -74,6 +74,10 @@ class _StreamingStudent:
         self.embed = model.input_embeddings
         self.hidden = self.embed.weight.shape[-1]
         self.batch_size = input_ids.shape[0]
+        self.kd_last_layer_only = kd_layers_are_last_only(
+            self.cfg.kd_layers,
+            self.model.student.base_model.model.config.num_hidden_layers,
+        )
         self._pos_dtype = batch_idx.dtype
 
         self.latent_start_embed = (
@@ -145,10 +149,15 @@ class _StreamingStudent:
         )
         # Call decoder directly so lm_head can be skipped when logits are not needed.
         causal_lm = self.model.student.base_model.model
-        want_hidden = hidden_request == "all_layers"
-        out = causal_lm.model(**kw, output_hidden_states=want_hidden)
+        want_all_hidden = hidden_request == "all_layers"
+        out = causal_lm.model(**kw, output_hidden_states=want_all_hidden)
         last_hidden = out.last_hidden_state if hidden_request == "last_layer" else None
-        hidden_states = out.hidden_states if want_hidden else None
+        if want_all_hidden:
+            hidden_states = out.hidden_states
+        elif hidden_request == "last_layer":
+            hidden_states = (out.last_hidden_state,)
+        else:
+            hidden_states = None
         logits = causal_lm.lm_head(out.last_hidden_state) if compute_logits else None
         return logits, last_hidden, hidden_states, out.past_key_values
 
@@ -245,7 +254,11 @@ class _StreamingStudent:
         return offsets
 
     def _collect_kd(self, row: int, offsets: list[int], hidden_states: tuple) -> None:
-        layers = select_kd_layers(hidden_states, self.cfg.kd_layers)
+        layers = (
+            hidden_states
+            if self.kd_last_layer_only
+            else select_kd_layers(hidden_states, self.cfg.kd_layers)
+        )
         if self.kd_by_row[row] is None:
             self.kd_by_row[row] = [[] for _ in layers]
         idx = torch.tensor(offsets, device=hidden_states[0].device)
@@ -440,9 +453,12 @@ class _StreamingStudent:
                 break
 
             step_embeds, step_mask = self._span_inputs(spans, width)
-            hidden_request: HiddenRequest = (
-                "all_layers" if self._needs_hidden(spans) else "none"
-            )
+            if self._needs_hidden(spans):
+                hidden_request: HiddenRequest = (
+                    "last_layer" if self.kd_last_layer_only else "all_layers"
+                )
+            else:
+                hidden_request = "none"
             logits, _, hidden_states = self._student_step(
                 step_embeds, step_mask, hidden_request
             )

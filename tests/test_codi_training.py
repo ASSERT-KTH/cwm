@@ -28,7 +28,9 @@ def _tiny_model() -> CwmForCausalLM:
     return CwmForCausalLM(config)
 
 
-def test_codi_loss_backprops_only_to_student() -> None:
+def test_codi_loss_backprops_to_shared_lora() -> None:
+    # CODI: teacher == student (shared base+LoRA). Both the teacher CE and the
+    # student CE co-train the SAME LoRA params; the frozen base stays grad-free.
     torch.manual_seed(0)
     student = _tiny_model()
 
@@ -55,6 +57,9 @@ def test_codi_loss_backprops_only_to_student() -> None:
     batch_idx, _ = model._teacher_positions(input_ids, labels, attention_mask)
     assert batch_idx.numel() == 2  # one valid latent_span_end per row
     assert output.loss.requires_grad
+    # Teacher CE is a live, finite term that co-trains the shared weights.
+    assert output.teacher_loss.requires_grad
+    assert torch.isfinite(output.teacher_loss) and output.teacher_loss > 0
 
     output.loss.backward()
 
@@ -64,6 +69,28 @@ def test_codi_loss_backprops_only_to_student() -> None:
     assert all("lora_" in name for name, _ in trainable)
     assert all(p.grad is not None for _, p in trainable)
     assert all(p.grad is None for _, p in frozen)
+
+
+def test_teacher_shares_weights_and_kd_target_detached() -> None:
+    # Teacher forward runs WITH grad (co-evolution); only the KD target hidden
+    # states are stop-gradient'd (CODI's sg[.]).
+    torch.manual_seed(0)
+    model, _ = _codi_model()
+    model.eval()  # deterministic (no LoRA dropout) for a clean check
+
+    input_ids = torch.tensor([[2, 5, 10, 7, 13, 9, 3]])
+    attention_mask = torch.ones_like(input_ids)
+    labels = input_ids.clone()
+
+    batch_idx, teacher_pos = model._teacher_positions(input_ids, labels, attention_mask)
+    t_sum, t_count, t_kd = model._teacher_forward(
+        input_ids, labels, attention_mask, batch_idx, teacher_pos
+    )
+
+    assert t_sum.requires_grad  # teacher CE backprops into the shared LoRA
+    assert int(t_count) > 0
+    assert t_kd is not None
+    assert all(not v.requires_grad for v in t_kd.vecs)  # KD target detached
 
 
 def _codi_model(latent_steps: int = 2) -> tuple[CodiModel, CodiConfig]:
