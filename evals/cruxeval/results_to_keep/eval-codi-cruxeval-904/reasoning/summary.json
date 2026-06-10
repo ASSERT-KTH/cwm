@@ -1,0 +1,17 @@
+{
+  "pass_at_1": 0.8018750000000001,
+  "n_total": 160,
+  "max_gen": 3072,
+  "batch_size": 8,
+  "n_generations": 10,
+  "temperature": 0.6,
+  "top_p": 0.95,
+  "use_sampling": true,
+  "seed": 42,
+  "mode": "reasoning",
+  "base_model": "./model_weights/cwm_hf",
+  "adapter_dir": "/proj/assert-berzelius/users/x_sirli/distill_adapter/codi_qlora_l1_n0_s1536_b32x1_lmw1.0_kdw1.0_e5_06081405",
+  "latent_steps": 1,
+  "data_split": "val",
+  "loader": "huggingface+codi"
+}

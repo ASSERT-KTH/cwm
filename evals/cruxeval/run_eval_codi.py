@@ -151,6 +151,19 @@ _EXTRACTORS = {
 }
 
 
+def make_batches(
+    kept: list[tuple[int, dict, list[int]]],
+    batch_size: int,
+) -> list[list[tuple[int, dict, list[int]]]]:
+    n_batches = (len(kept) + batch_size - 1) // batch_size
+    batches = [[] for _ in range(n_batches)]
+    # Spread the longest prompts across different batches so the shared queue
+    # does not end with one pathological all-long batch.
+    for i, item in enumerate(sorted(kept, key=lambda x: x[0], reverse=True)):
+        batches[i % n_batches].append(item)
+    return [b for b in batches if b]
+
+
 def build_thought_projector(hidden_size: int, device, dtype) -> nn.Sequential:
     """Same architecture as ``CodiModel.__init__`` so the state_dict lines up."""
     proj = nn.Sequential(
@@ -419,8 +432,7 @@ def main() -> None:
             for s in dataset
             for prompt in [build_prompt_ids(args.mode, s["code"], s["input"], tok)]
         ]
-        kept.sort(key=lambda x: x[0])
-        batches = [kept[i:i + args.batch_size] for i in range(0, len(kept), args.batch_size)]
+        batches = make_batches(kept, args.batch_size)
     else:
         batches = None
     if ddp:
@@ -537,6 +549,7 @@ def main() -> None:
             "adapter_dir": args.adapter_dir,
             "latent_steps": args.latent_steps,
             "data_split": args.data_split,
+            "batching": "round_robin",
             "loader": "huggingface+codi",
         }
         with (dump_path / "summary.json").open("w") as f:
