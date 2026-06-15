@@ -36,12 +36,11 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from datasets import load_dataset
 from torch import nn
 from transformers.cache_utils import DynamicCache
 
 from cwm.training.codi_config import default_codi_config_from_tokenizer
-from dataset.cruxeval.dataset import cruxeval_split
+from dataset.sources import load_rows
 from evals.cruxeval.evaluate import (
     check_correct,
     extract_answer,
@@ -132,7 +131,9 @@ def build_reasoning_prompt_ids(code: str, input_str: str, tok) -> list[int]:
 def build_prompt_ids(mode: str, code: str, input_str: str, tok) -> list[int]:
     if mode == "direct":
         ids = [] if tok.bos_token_id is None else [int(tok.bos_token_id)]
-        ids += tok.encode(make_direct_output_prompt(code, input_str), add_special_tokens=False)
+        ids += tok.encode(
+            make_direct_output_prompt(code, input_str), add_special_tokens=False
+        )
         return ids
     if mode == "reasoning":
         return build_reasoning_prompt_ids(code, input_str, tok)
@@ -191,7 +192,10 @@ class CodiGenerator:
     """
 
     def __init__(self, student, projector, cfg, device) -> None:
-        assert cfg.latent_start_token_id is not None and cfg.latent_end_token_id is not None
+        assert (
+            cfg.latent_start_token_id is not None
+            and cfg.latent_end_token_id is not None
+        )
         self.lm = student.base_model.model  # CwmForCausalLM
         self.embed = student.get_input_embeddings()
         self.proj = projector
@@ -209,15 +213,26 @@ class CodiGenerator:
         """
         c = self.cfg
         if token == c.latent_span_start_token_id:
-            return [token, c.latent_start_token_id, *([None] * c.latent_steps), c.latent_end_token_id]
+            return [
+                token,
+                c.latent_start_token_id,
+                *([None] * c.latent_steps),
+                c.latent_end_token_id,
+            ]
         return [token]
 
     @staticmethod
     def _endswith(tokens: list[int], suffix: list[int]) -> bool:
-        return bool(suffix) and len(tokens) >= len(suffix) and tokens[-len(suffix):] == suffix
+        return (
+            bool(suffix)
+            and len(tokens) >= len(suffix)
+            and tokens[-len(suffix) :] == suffix
+        )
 
     @staticmethod
-    def _sample_next(logits: torch.Tensor, temperature: float, top_p: float) -> torch.Tensor:
+    def _sample_next(
+        logits: torch.Tensor, temperature: float, top_p: float
+    ) -> torch.Tensor:
         if temperature <= 0:
             return logits.argmax(-1)
         logits = logits / temperature
@@ -229,7 +244,9 @@ class CodiGenerator:
             remove[..., 1:] = remove[..., :-1].clone()
             remove[..., 0] = False
             sorted_probs = sorted_probs.masked_fill(remove, 0.0)
-            sorted_probs = sorted_probs / sorted_probs.sum(dim=-1, keepdim=True).clamp_min(1e-12)
+            sorted_probs = sorted_probs / sorted_probs.sum(
+                dim=-1, keepdim=True
+            ).clamp_min(1e-12)
             sampled = torch.multinomial(sorted_probs, num_samples=1).squeeze(-1)
             return sorted_idx.gather(-1, sampled.unsqueeze(-1)).squeeze(-1)
         probs = torch.softmax(logits, dim=-1)
@@ -253,20 +270,23 @@ class CodiGenerator:
         ids = torch.zeros((B, lmax), dtype=torch.long, device=dev)
         mask = torch.zeros((B, lmax), dtype=torch.long, device=dev)
         for i, p in enumerate(prompts):
-            ids[i, lmax - lens[i]:] = torch.tensor(p, device=dev)
-            mask[i, lmax - lens[i]:] = 1
+            ids[i, lmax - lens[i] :] = torch.tensor(p, device=dev)
+            mask[i, lmax - lens[i] :] = 1
         pos = (mask.cumsum(1) - 1).clamp(min=0)
 
         cache = DynamicCache()
         hidden = self.lm.model(
-            inputs_embeds=self.embed(ids), attention_mask=mask,
-            position_ids=pos, past_key_values=cache, use_cache=True,
+            inputs_embeds=self.embed(ids),
+            attention_mask=mask,
+            position_ids=pos,
+            past_key_values=cache,
+            use_cache=True,
         ).last_hidden_state[:, -1]
         nextpos = torch.tensor(lens, device=dev)
 
         gen: list[list[int]] = [[] for _ in range(B)]
         pending: list[list[int | None]] = [[] for _ in range(B)]
-        base = [hidden[i:i + 1] for i in range(B)]  # per-lane hidden for latent proj
+        base = [hidden[i : i + 1] for i in range(B)]  # per-lane hidden for latent proj
         done = [False] * B
         stop_sequences = stop_sequences or []
 
@@ -278,7 +298,9 @@ class CodiGenerator:
             else:
                 pending[i] = self._schedule(token)
 
-        for i, t in enumerate(self._sample_next(self.lm.lm_head(hidden), temperature, top_p).tolist()):
+        for i, t in enumerate(
+            self._sample_next(self.lm.lm_head(hidden), temperature, top_p).tolist()
+        ):
             take(i, t)
 
         while not all(done):
@@ -297,11 +319,14 @@ class CodiGenerator:
 
             mask = torch.cat([mask, torch.ones(B, 1, dtype=torch.long, device=dev)], 1)
             hidden = self.lm.model(
-                inputs_embeds=emb, attention_mask=mask,
-                position_ids=nextpos.unsqueeze(1), past_key_values=cache, use_cache=True,
+                inputs_embeds=emb,
+                attention_mask=mask,
+                position_ids=nextpos.unsqueeze(1),
+                past_key_values=cache,
+                use_cache=True,
             ).last_hidden_state[:, -1]
             nextpos = nextpos + 1
-            base = [hidden[i:i + 1] for i in range(B)]
+            base = [hidden[i : i + 1] for i in range(B)]
 
             if sample:
                 logits = self.lm.lm_head(hidden[sample])
@@ -313,9 +338,15 @@ class CodiGenerator:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--adapter_dir", required=True, help="CODI training output_dir (LoRA adapter + thought_projector.pt)")
+    parser.add_argument(
+        "--adapter_dir",
+        required=True,
+        help="CODI training output_dir (LoRA adapter + thought_projector.pt)",
+    )
     parser.add_argument("--base_model", default="model_weights/cwm_hf")
-    parser.add_argument("--latent_steps", type=int, default=2, help="Must match training")
+    parser.add_argument(
+        "--latent_steps", type=int, default=2, help="Must match training"
+    )
     parser.add_argument("--dump_dir", default="eval-codi-cruxeval")
     parser.add_argument("--mode", default="trace_full", choices=_MODES)
     parser.add_argument("--n_samples", type=int, default=-1)
@@ -323,14 +354,11 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.6)
     parser.add_argument("--top_p", type=float, default=0.95)
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument(
-        "--data_split",
-        default="val",
-        choices=["train", "val", "all"],
-        help="cruxeval_split: sweep on held-out 'val' (matches train data_split=train)",
-    )
+    parser.add_argument("--data_source", nargs="+", required=True, help="dataset name(s) to merge")
     parser.add_argument("--max_gen", type=int, default=0, help="0 = mode default")
-    parser.add_argument("--batch_size", type=int, default=8, help="Lanes per lock-step forward.")
+    parser.add_argument(
+        "--batch_size", type=int, default=8, help="Lanes per lock-step forward."
+    )
     parser.add_argument(
         "--dist_timeout_minutes",
         type=int,
@@ -416,7 +444,7 @@ def main() -> None:
     cfg = default_codi_config_from_tokenizer(tok, latent_steps=args.latent_steps)
     generator = CodiGenerator(student, projector, cfg, device)
 
-    dataset = cruxeval_split(load_dataset("cruxeval-org/cruxeval", split="test"), args.data_split)
+    dataset = load_rows(args.data_source)
     if args.n_samples > 0:
         dataset = dataset[: args.n_samples]
 
@@ -439,7 +467,9 @@ def main() -> None:
         payload = [batches]
         dist.broadcast_object_list(payload, src=0)
         batches = payload[0]
-    logger.info("rank %d/%d: shared queue of %d batches", rank, world_size, len(batches))
+    logger.info(
+        "rank %d/%d: shared queue of %d batches", rank, world_size, len(batches)
+    )
 
     # Shared atomic work queue: a counter file in the (shared) dump dir hands out
     # the next unclaimed batch index. Idle ranks pull the next batch instead of
@@ -456,6 +486,7 @@ def main() -> None:
         rank_results_path.unlink()
 
     with rank_results_path.open("a") as out:
+
         def write(row: dict) -> None:
             out.write(json.dumps(row) + "\n")
             out.flush()
@@ -490,25 +521,39 @@ def main() -> None:
                 for i, ((_sort_len, s, _prompt), g) in enumerate(zip(batch, gens)):
                     generation = tok.decode(g, skip_special_tokens=False)
                     predicted = extract_fn(generation, s["input"])
-                    correct = check_correct(s["code"], s["output"], predicted) if predicted is not None else False
-                    sample_gens[i].append({
-                        "generation": generation,
-                        "predicted": predicted,
-                        "correct": correct,
-                    })
+                    correct = (
+                        check_correct(s["code"], s["output"], predicted)
+                        if predicted is not None
+                        else False
+                    )
+                    sample_gens[i].append(
+                        {
+                            "generation": generation,
+                            "predicted": predicted,
+                            "correct": correct,
+                        }
+                    )
             dt = (time.perf_counter() - t0) / (len(batch) * args.n_generations)
             for (_sort_len, s, _prompt), gens_for_sample in zip(batch, sample_gens):
                 n_correct = sum(g["correct"] for g in gens_for_sample)
-                write({
-                    "id": s["id"],
-                    "mode": args.mode,
-                    "expected": s["output"],
-                    "pass_at_1": n_correct / args.n_generations,
-                    "generations": gens_for_sample,
-                })
+                write(
+                    {
+                        "id": s["id"],
+                        "mode": args.mode,
+                        "expected": s["output"],
+                        "pass_at_1": n_correct / args.n_generations,
+                        "generations": gens_for_sample,
+                    }
+                )
             n_done += len(batch)
-            logger.info("rank %d claimed batch %d/%d (%d samples done) %.1fs/generation",
-                        rank, b, len(batches), n_done, dt)
+            logger.info(
+                "rank %d claimed batch %d/%d (%d samples done) %.1fs/generation",
+                rank,
+                b,
+                len(batches),
+                n_done,
+                dt,
+            )
     logger.info("rank %d: %d samples scored across claimed batches", rank, n_done)
 
     if ddp:
@@ -524,7 +569,11 @@ def main() -> None:
         id_to_idx = {s["id"]: i for i, s in enumerate(dataset)}
         all_results.sort(key=lambda r: id_to_idx.get(r["id"], 0))
 
-        pass_at_1 = sum(r["pass_at_1"] for r in all_results) / len(all_results) if all_results else 0.0
+        pass_at_1 = (
+            sum(r["pass_at_1"] for r in all_results) / len(all_results)
+            if all_results
+            else 0.0
+        )
         print(
             f"\nCRUXEval-O {args.mode} pass@1: {pass_at_1:.4f} "
             f"(n={len(all_results)}, {args.n_generations} gens each)"
@@ -548,7 +597,6 @@ def main() -> None:
             "base_model": args.base_model,
             "adapter_dir": args.adapter_dir,
             "latent_steps": args.latent_steps,
-            "data_split": args.data_split,
             "batching": "round_robin",
             "loader": "huggingface+codi",
         }

@@ -3,10 +3,12 @@
 """
 vLLM backend for the Table 9 eval -- true 4-bit AWQ (compressed-tensors) at low
 VRAM. Same prompt, scoring, and dump schema as run_eval.py / run_eval_hf.py
-(score.py re-scores these runs too). Greedy decoding.
+(score.py re-scores these runs too). Greedy decoding. Data source via
+``--data_source`` (see ``dataset.sources``).
 
     python -m evals.trace_analysis.run_eval_vllm \\
-        --model model_weights/cwm-awq-4bit --dump_dir eval-cwm-table9-awq-4bit
+        --model model_weights/cwm-awq-4bit --data_source cruxeval_o \\
+        --dump_dir eval-cwm-table9-awq-4bit
 """
 
 from __future__ import annotations
@@ -17,17 +19,17 @@ import json
 import logging
 from pathlib import Path
 
-from datasets import load_dataset
 from transformers import AutoTokenizer
 
 from evals.cruxeval.evaluate import check_correct, extract_answer_trace_full
-from dataset.cruxeval.ground_truth import ground_truth_trace
+from dataset.ground_truth import ground_truth_trace
+from dataset.sources import load_rows
 from evals.trace_analysis.metrics import compute_trace_metrics, format_table9
 from evals.trace_analysis.run_eval_hf import (
     _aggregate_results,
     build_trace_full_prompt_ids,
 )
-from dataset.cruxeval.trace_format import parse_generated_trace
+from dataset.trace_format import parse_generated_trace
 
 logger = logging.getLogger(__name__)
 
@@ -38,6 +40,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="model_weights/cwm-awq-4bit")
     parser.add_argument("--dump_dir", default="eval-cwm-table9-awq-4bit")
+    parser.add_argument("--data_source", nargs="+", required=True, help="dataset name(s) to merge")
     parser.add_argument("--n_samples", type=int, default=-1)
     parser.add_argument("--max_gen", type=int, default=_MAX_GEN)
     parser.add_argument("--tp_size", type=int, default=1)
@@ -57,7 +60,7 @@ def main() -> None:
         gpu_memory_utilization=args.gpu_mem_util,
     )
 
-    dataset = list(load_dataset("cruxeval-org/cruxeval", split="test"))
+    dataset = load_rows(args.data_source)
     if args.n_samples > 0:
         dataset = dataset[: args.n_samples]
 

@@ -1,31 +1,27 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 """
-Reproduction of Table 9 from "CWM: An Open-Weights LLM for Research on Code
-Generation with World Models" (arXiv:2510.02387): a detailed, component-wise
-analysis of CWM's full execution-trace prediction on CRUXEval.
+Reproduction of Table 9 from "CWM: An Open-Weights LLM ..." (arXiv:2510.02387):
+component-wise analysis of CWM's full execution-trace prediction.
 
-For each CRUXEval sample we prompt CWM in full-trace mode with **greedy
-decoding** (as in the paper), parse the generated trace, build a ground-truth
-trace by executing the function under ``sys.settrace`` in CWM's trace format,
-and score the individual components:
+Per sample, greedy-decode a full trace (as in the paper), parse it, build a
+ground-truth trace via ``sys.settrace``, and score:
 
     Output     pass@1
     Trace      Valid Trace Format / State Exact Match / Action Exact Match
     States     Valid JSON Format / Key Match / Key+Value Match
     Statistics Avg State Length (Token) / Avg Action Length (Token)
 
-Only the CRUXEval column is reproducible from open data; the paper's
-"Function-level" column uses Meta-internal data. See README.md for the known
-gaps between this re-implementation and the paper's internal tracer.
+Data source via ``data_source`` (see ``dataset.sources``); the paper's
+"Function-level" column uses Meta-internal data. See README.md for gaps vs.
+the internal tracer.
 
 Example (8 GPUs, 4 TP groups of 2 -> 4-way data parallelism):
 
     python -m torch.distributed.run --nproc_per_node=8 \\
         -m evals.trace_analysis.run_eval \\
-        checkpoint_dir=/path/to/cwm \\
-        gen_args.tp_size=2 \\
-        dump_dir=./eval-cwm-table9
+        checkpoint_dir=/path/to/cwm data_source=[cruxeval_o] \\
+        gen_args.tp_size=2 dump_dir=./eval-cwm-table9
 """
 
 import dataclasses
@@ -38,7 +34,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed
-from datasets import load_dataset
+from omegaconf import MISSING
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from tqdm import tqdm
 
@@ -57,14 +53,15 @@ from cwm.rl.lib.impgen import ImpGen
 from evals.args import FastGenArgs, SetupArgs
 from evals.cruxeval.evaluate import check_correct, extract_answer_trace_full
 from evals.cruxeval.prompts import make_trace_full_prompt_tokens
-from dataset.cruxeval.ground_truth import ground_truth_trace
+from dataset.ground_truth import ground_truth_trace
+from dataset.sources import load_rows
 from evals.trace_analysis.metrics import (
     Table9Aggregate,
     aggregate,
     compute_trace_metrics,
     format_table9,
 )
-from dataset.cruxeval.trace_format import parse_generated_trace
+from dataset.trace_format import parse_generated_trace
 
 logger = logging.getLogger(__name__)
 
@@ -76,8 +73,8 @@ _MAX_GEN = 8192
 class TraceAnalysisArgs:
     checkpoint_dir: str = ""
     dump_dir: str = "eval-cwm-table9"
-    # Number of samples to evaluate; -1 evaluates all 800.
-    n_samples: int = -1
+    data_source: list[str] = MISSING  # required, e.g. data_source=[mbpp,humaneval]
+    n_samples: int = -1  # -1 = whole dataset
     max_gen: int = 0  # 0 -> use _MAX_GEN
     seed: int = 42
     # Table 9 uses greedy decoding: use_sampling defaults to False here.
@@ -228,7 +225,7 @@ def main(args: TraceAnalysisArgs) -> None:
     torch.cuda.empty_cache()
     g = ImpGen(fg, tp_group.rank(), tp_group)
 
-    dataset = list(load_dataset("cruxeval-org/cruxeval", split="test"))
+    dataset = load_rows(args.data_source)
     if args.n_samples > 0:
         dataset = dataset[: args.n_samples]
     my_samples = dataset[dp_rank::n_dp]

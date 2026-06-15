@@ -7,10 +7,12 @@ Loads HF weights via ``AutoModelForCausalLM`` and generates with
 ``model.generate`` instead of the native FastGen stack. Works for full-precision
 ``facebook/cwm`` and quantized builds (e.g. AWQ-4bit / compressed-tensors); the
 quant config is read from the checkpoint. Prompt and dump schema match the native
-eval, so ``score.py`` re-scores these runs too. Greedy decoding.
+eval, so ``score.py`` re-scores these runs too. Greedy decoding. Data source via
+``--data_source`` (see ``dataset.sources``).
 
     torchrun --nproc_per_node=8 -m evals.trace_analysis.run_eval_hf \\
-        --model model_weights/cwm-awq-4bit --dump_dir eval-cwm-table9-awq-4bit
+        --model model_weights/cwm-awq-4bit --data_source cruxeval_o \\
+        --dump_dir eval-cwm-table9-awq-4bit
 """
 
 from __future__ import annotations
@@ -24,12 +26,12 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
-from datasets import load_dataset
 from tqdm import tqdm
 
 from evals.cruxeval.evaluate import check_correct, extract_answer_trace_full
 from evals.cruxeval.prompts import _make_trace_context
-from dataset.cruxeval.ground_truth import ground_truth_trace
+from dataset.ground_truth import ground_truth_trace
+from dataset.sources import load_rows
 from evals.trace_analysis.metrics import (
     Table9Aggregate,
     TraceMetrics,
@@ -37,7 +39,7 @@ from evals.trace_analysis.metrics import (
     compute_trace_metrics,
     format_table9,
 )
-from dataset.cruxeval.trace_format import parse_generated_trace
+from dataset.trace_format import parse_generated_trace
 
 logger = logging.getLogger(__name__)
 
@@ -79,6 +81,7 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--model", default="model_weights/cwm_hf")
     parser.add_argument("--dump_dir", default="eval-cwm-table9-hf")
+    parser.add_argument("--data_source", nargs="+", required=True, help="dataset name(s) to merge")
     parser.add_argument("--n_samples", type=int, default=-1)
     parser.add_argument("--max_gen", type=int, default=_MAX_GEN)
     parser.add_argument(
@@ -124,7 +127,7 @@ def main() -> None:
     def token_len(s: str) -> int:
         return len(tok.encode(s, add_special_tokens=False))
 
-    dataset = list(load_dataset("cruxeval-org/cruxeval", split="test"))
+    dataset = load_rows(args.data_source)
     if args.n_samples > 0:
         dataset = dataset[: args.n_samples]
     my_samples = dataset[rank::world_size] if ddp else dataset

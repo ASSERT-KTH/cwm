@@ -1,25 +1,15 @@
 # Copyright (c) Meta Platforms, Inc. and affiliates.
 
 """
-CRUXEval-O evaluation for CWM.
+Output-prediction eval for CWM (CRUXEval-O style): canonical direct-output
+prompt + FastGen/ImpGen stack. Data source via ``data_source`` (dataset.sources).
 
-Uses the canonical direct-output prompt format from the original CRUXEval benchmark
-and CWM's FastGen/ImpGen inference stack.
-
-Example (2 GPUs, 1 TP group):
-
-    python -m torch.distributed.run --nproc_per_node=2 \\
-        -m evals.cruxeval.run_eval \\
-        checkpoint_dir=/path/to/cwm \\
-        dump_dir=./eval-cwm-cruxeval
-
-Example (8 GPUs, 4 TP groups of 2 → 4-way data parallelism):
+Example (8 GPUs, 4 TP groups of 2 -> 4-way data parallelism):
 
     python -m torch.distributed.run --nproc_per_node=8 \\
         -m evals.cruxeval.run_eval \\
-        checkpoint_dir=/path/to/cwm \\
-        gen_args.tp_size=2 \\
-        dump_dir=./eval-cwm-cruxeval
+        checkpoint_dir=/path/to/cwm data_source=[cruxeval_o] \\
+        gen_args.tp_size=2 dump_dir=./eval-cwm-cruxeval
 """
 
 import json
@@ -31,7 +21,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed
-from datasets import load_dataset
+from omegaconf import MISSING
 from torch.distributed.device_mesh import DeviceMesh, init_device_mesh
 from tqdm import tqdm
 
@@ -47,6 +37,7 @@ from cwm.common.params import dataclass_to_dict, load_from_cli
 from cwm.fastgen.generate import FastGen
 from cwm.fastgen.utils.loading import build_fastgen_model, build_tokenizer_from_ckpt
 from cwm.rl.lib.impgen import ImpGen
+from dataset.sources import load_rows
 from evals.args import FastGenArgs, SetupArgs
 from evals.cruxeval.evaluate import (
     check_correct,
@@ -77,10 +68,10 @@ _MAX_GEN: dict[str, int] = {
 class CruxEvalArgs:
     checkpoint_dir: str = ""
     dump_dir: str = "eval-cwm-cruxeval"
+    data_source: list[str] = MISSING  # required, e.g. data_source=[mbpp,humaneval]
     # Evaluation mode: direct | reasoning | trace_full | trace_single_step
     mode: str = "direct"
-    # Number of samples to evaluate; -1 evaluates all 800
-    n_samples: int = -1
+    n_samples: int = -1  # -1 = whole split
     # Max tokens to generate per sample (0 = use mode default)
     max_gen: int = 0
     # Number of generations per sample for pass@1 estimation
@@ -233,7 +224,7 @@ def main(args: CruxEvalArgs) -> None:
     g = ImpGen(fg, tp_group.rank(), tp_group)
 
     # Load dataset and partition across DP ranks
-    dataset = list(load_dataset("cruxeval-org/cruxeval", split="test"))
+    dataset = load_rows(args.data_source)
     if args.n_samples > 0:
         dataset = dataset[: args.n_samples]
     my_samples = dataset[dp_rank::n_dp]

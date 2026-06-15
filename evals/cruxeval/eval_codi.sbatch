@@ -1,21 +1,13 @@
 #!/bin/bash
-#
-# Evaluate completed CODI QLoRA runs 904/905/906 on all CRUXEval CODI modes.
-#
-# Task mapping:
-#   0..3   -> run 904, direct/reasoning/trace_full/trace_single_step
-#   4..7   -> run 905, direct/reasoning/trace_full/trace_single_step
-#   8..11  -> run 906, direct/reasoning/trace_full/trace_single_step
-#
-# Limit to four concurrent tasks so each wave matches the 907 sweep footprint.
-#SBATCH -J codi904-906-cruxeval
+#SBATCH -J codi_cruxeval_val
 #SBATCH -t 06:00:00
 #SBATCH -N 1
-#SBATCH --gpus-per-node=A100-SXM4-40GB:8
+#SBATCH --gpus=4
+#SBATCH -C "thin"
 #SBATCH -A berzelius-2026-167
-#SBATCH --array=0-11%4
-#SBATCH -o logs/codi904_906_cruxeval_%A_%a.out
-#SBATCH -e logs/codi904_906_cruxeval_%A_%a.err
+#SBATCH --array=0-3%4
+#SBATCH -o logs/codi_cruxeval_val_%A_%a.out
+#SBATCH -e logs/codi_cruxeval_val_%A_%a.err
 
 mkdir -p logs
 
@@ -24,11 +16,9 @@ mamba activate CWM
 
 MODES=(direct reasoning trace_full trace_single_step)
 MAX_GENS=(512 3072 3072 512)
-RUN_IDS=(904 905 906)
+RUN_IDS=(16807668)
 ADAPTER_DIRS=(
-    /proj/assert-berzelius/users/x_sirli/distill_adapter/codi_qlora_l1_n0_s1536_b32x1_lmw1.0_kdw1.0_e5_06081405
-    /proj/assert-berzelius/users/x_sirli/distill_adapter/codi_qlora_l1_n0_s1536_b32x1_lmw1.0_kdw2.0_e5_06081405
-    /proj/assert-berzelius/users/x_sirli/distill_adapter/codi_qlora_l1_n0_s1536_b32x1_lmw2.0_kdw1.0_e5_06081405
+    /proj/assert-berzelius/users/x_sirli/distill_adapter/codi_qlora_l1_n0_s1280_b32x1_tw1.0_lmw1.0_kdw1.0_e5_06101018
 )
 
 RUN_INDEX=$((SLURM_ARRAY_TASK_ID / 4))
@@ -48,7 +38,7 @@ N_GENERATIONS=10
 TEMPERATURE=0.6
 TOP_P=0.95
 SEED=42
-DATA_SPLIT=val
+DATA_SOURCE=cruxeval_o
 BATCH_SIZE=8
 DIST_TIMEOUT_MINUTES=360
 DEVICE_MAP=auto
@@ -79,7 +69,7 @@ python -m torch.distributed.run --nproc_per_node=${NPROC} \
     --temperature "${TEMPERATURE}" \
     --top_p "${TOP_P}" \
     --seed "${SEED}" \
-    --data_split "${DATA_SPLIT}" \
+    --data_source "${DATA_SOURCE}" \
     --max_gen "${MAX_GEN}" \
     --batch_size "${BATCH_SIZE}" \
     --dist_timeout_minutes "${DIST_TIMEOUT_MINUTES}" \
