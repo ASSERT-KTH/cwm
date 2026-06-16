@@ -38,7 +38,7 @@ N_GENERATIONS=10
 TEMPERATURE=0.6
 TOP_P=0.95
 SEED=42
-DATA_SPLIT=val
+DATA_SOURCE=cruxeval_o
 BATCH_SIZE=8
 DIST_TIMEOUT_MINUTES=360
 DEVICE_MAP=auto
@@ -73,7 +73,7 @@ python -m torch.distributed.run --nproc_per_node=${NPROC} \
     --temperature "${TEMPERATURE}" \
     --top_p "${TOP_P}" \
     --seed "${SEED}" \
-    --data_split "${DATA_SPLIT}" \
+    --data_source "${DATA_SOURCE}" \
     --max_gen "${MAX_GEN}" \
     --batch_size "${BATCH_SIZE}" \
     --dist_timeout_minutes "${DIST_TIMEOUT_MINUTES}" \

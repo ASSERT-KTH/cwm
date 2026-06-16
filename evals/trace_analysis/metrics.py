@@ -28,7 +28,7 @@ from __future__ import annotations
 from collections.abc import Callable
 from dataclasses import dataclass
 
-from dataset.cruxeval.trace_format import TraceEvent, TraceFrame
+from dataset.trace_format import TraceEvent, TraceFrame
 
 
 @dataclass

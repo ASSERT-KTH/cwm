@@ -11,6 +11,7 @@ from pathlib import Path
 import bitsandbytes
 import torch
 import torch.distributed as dist
+from omegaconf import MISSING
 
 from cwm.training.codi import CodiModel
 from cwm.training.codi_config import default_codi_config_from_tokenizer
@@ -46,8 +47,9 @@ class TrainArgs:
     max_grad_norm: float = 1.0
     save_every_steps: int = 0  # 0 = save only at end
     n_samples: int = -1
-    data_split: str = "train"  # train/val/all; train holds out the val sweep set
+    data_source: list[str] = MISSING  # required, e.g. data_source=[mbpp,humaneval]
     max_seq_len: int = 8192
+    build_workers: int = 0  # 0/1 = serial dataset build; >1 = forked Pool (rank0 only)
     megabatch_mult: int = 8  # length-bucketing strength; larger = tighter packing
     max_batch_tokens: int = 0  # 0 = fixed batch_size; >0 = padded-token budget
     seed: int = 42
@@ -423,7 +425,8 @@ def main(args: TrainArgs) -> None:
             seed=args.seed,
             megabatch_mult=args.megabatch_mult,
             max_batch_tokens=args.max_batch_tokens,
-            split=args.data_split,
+            build_workers=args.build_workers,
+            data_source=args.data_source,
         )
 
         params = [p for p in model.parameters() if p.requires_grad]

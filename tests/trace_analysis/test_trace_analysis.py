@@ -11,13 +11,17 @@ perfect 100% on every Table 9 component.
 
 from __future__ import annotations
 
-from dataset.cruxeval.ground_truth import (
+import math
+import re as _re
+
+from dataset.ground_truth import (
+    check_purity,
     ground_truth_trace,
     make_trace_context,
     render_value,
 )
 from evals.trace_analysis.metrics import compute_trace_metrics
-from dataset.cruxeval.trace_format import (
+from dataset.trace_format import (
     TraceEvent,
     parse_generated_trace,
     render_frames_to_generation,
@@ -116,6 +120,31 @@ def test_malformed_generation_invalid_format():
     pred_frames, well_formed = parse_generated_trace(gen)
     assert not well_formed
     assert pred_frames == []
+
+
+def test_render_value_strips_module_path():
+    # Module reprs embed a machine-specific absolute path -> drop it.
+    assert render_value(math) == "<module 'math'>"
+    assert render_value(_re) == "<module 're'>"
+    # Iterators keep their object repr (only the heap address is stripped).
+    assert render_value(iter([1, 2])) == "<list_iterator object>"
+
+
+def test_check_purity_pure_vs_io():
+    assert check_purity("def f(x):\n    return x + 1\n", "5") == set()  # pure
+    assert "stdout" in check_purity("def f(x):\n    print(x)\n    return x\n", "5")
+    assert "file" in check_purity('def f(x):\n    open("/no/such")\n    return x\n', "5")
+    # An import of a pure stdlib module is NOT I/O.
+    assert check_purity("import math\ndef f(x):\n    return math.sqrt(x)\n", "4") == set()
+    # A raised exception is NOT impurity (EXCEPTION frames are valid trace data).
+    assert check_purity("def f(x):\n    return [1][x]\n", "9") == set()
+
+
+def test_truncated_trace_marks_error():
+    code = "def f(n):\n    s = 0\n    for i in range(n):\n        s += i\n    return s\n"
+    frames, err = ground_truth_trace(code, "1000", max_frames=20)
+    assert err is not None and err.startswith("Truncated")
+    assert len(frames) <= 20
 
 
 def test_token_length_stats():

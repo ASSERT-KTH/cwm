@@ -9,7 +9,7 @@ from __future__ import annotations
 
 from typing import TYPE_CHECKING
 
-from dataset.cruxeval.ground_truth import make_trace_context as _make_trace_context
+from dataset.ground_truth import make_trace_context as _make_trace_context
 
 if TYPE_CHECKING:
     from cwm.text.tokenizers import CWMInstructTokenizer

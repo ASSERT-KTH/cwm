@@ -3,8 +3,44 @@ from transformers import CwmConfig, CwmForCausalLM
 
 from cwm.training.codi import CodiModel
 from cwm.training.codi_config import CodiConfig
-from cwm.training.data import MegabatchSortishSampler
+from cwm.training.data import IGNORE_INDEX, MegabatchSortishSampler, build_dataset, build_example
 from cwm.training.codi_streaming import streaming_student_outputs
+
+
+class _FakeTok:
+    """Minimal stand-in: build_example only needs bos_token_id + encode()."""
+
+    bos_token_id = 1
+
+    def encode(self, s, add_special_tokens=False):  # noqa: ANN001
+        return [ord(c) % 50 + 2 for c in s]
+
+
+def test_build_example_skips_impure_keeps_pure():
+    tok = _FakeTok()
+    pure = build_example("def f(x):\n    return x + 1\n", "5", tok, max_seq_len=8192)
+    assert pure is not None
+    ids, labels = pure
+    assert len(ids) == len(labels)
+    assert labels[0] == IGNORE_INDEX  # prompt tokens are masked
+    assert build_example("def f(x):\n    print(x)\n    return x\n", "5", tok, max_seq_len=8192) is None
+
+
+def test_build_dataset_drops_runaway_without_hanging():
+    tok = _FakeTok()
+    rows = [
+        {"code": "def f(x):\n    return x * 2\n", "input": "3"},               # pure, fast
+        {"code": "def f(x):\n    while True:\n        pass\n", "input": "1"},   # runaway
+    ]
+    out = build_dataset(rows, tok)
+    assert len(out) == 1  # runaway dropped via SIGALRM, pure kept
+
+
+def test_build_dataset_parallel_matches_serial():
+    # Forked workers inherit the tokenizer COW; ordered imap -> identical result.
+    tok = _FakeTok()
+    rows = [{"code": f"def f(x):\n    return x + {k}\n", "input": "5"} for k in range(6)]
+    assert build_dataset(rows, tok, workers=2) == build_dataset(rows, tok, workers=0)
 
 
 def _tiny_model() -> CwmForCausalLM:
