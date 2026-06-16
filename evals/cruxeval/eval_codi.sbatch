@@ -1,21 +1,13 @@
 #!/bin/bash
-#
-# Evaluate completed CODI QLoRA runs 904/905/906 on all CRUXEval CODI modes.
-#
-# Task mapping:
-#   0..3   -> run 904, direct/reasoning/trace_full/trace_single_step
-#   4..7   -> run 905, direct/reasoning/trace_full/trace_single_step
-#   8..11  -> run 906, direct/reasoning/trace_full/trace_single_step
-#
-# Limit to four concurrent tasks so each wave matches the 907 sweep footprint.
-#SBATCH -J codi904-906-cruxeval
+#SBATCH -J codi_cruxeval_val
 #SBATCH -t 06:00:00
 #SBATCH -N 1
-#SBATCH --gpus-per-node=A100-SXM4-40GB:8
+#SBATCH --gpus=4
+#SBATCH -C "thin"
 #SBATCH -A berzelius-2026-167
-#SBATCH --array=0-11%4
-#SBATCH -o logs/codi904_906_cruxeval_%A_%a.out
-#SBATCH -e logs/codi904_906_cruxeval_%A_%a.err
+#SBATCH --array=0-3%4
+#SBATCH -o logs/codi_cruxeval_val_%A_%a.out
+#SBATCH -e logs/codi_cruxeval_val_%A_%a.err
 
 mkdir -p logs
 
@@ -24,11 +16,9 @@ mamba activate CWM
 
 MODES=(direct reasoning trace_full trace_single_step)
 MAX_GENS=(512 3072 3072 512)
-RUN_IDS=(904 905 906)
+RUN_IDS=(16807668)
 ADAPTER_DIRS=(
-    /proj/assert-berzelius/users/x_sirli/distill_adapter/codi_qlora_l1_n0_s1536_b32x1_lmw1.0_kdw1.0_e5_06081405
-    /proj/assert-berzelius/users/x_sirli/distill_adapter/codi_qlora_l1_n0_s1536_b32x1_lmw1.0_kdw2.0_e5_06081405
-    /proj/assert-berzelius/users/x_sirli/distill_adapter/codi_qlora_l1_n0_s1536_b32x1_lmw2.0_kdw1.0_e5_06081405
+    /proj/assert-berzelius/users/x_sirli/distill_adapter/codi_qlora_l1_n0_s1280_b32x1_tw1.0_lmw1.0_kdw1.0_e5_06101018
 )
 
 RUN_INDEX=$((SLURM_ARRAY_TASK_ID / 4))
@@ -55,6 +45,9 @@ DEVICE_MAP=auto
 LOAD_4BIT=1
 
 NPROC=$(nvidia-smi -L | wc -l)
+# Unique rendezvous port per array task: sibling tasks can share a node and
+# would otherwise collide on torchrun's default 29500 (EADDRINUSE).
+MASTER_PORT=$((29500 + SLURM_ARRAY_TASK_ID))
 
 EXTRA_ARGS=()
 if [[ "${LOAD_4BIT}" == "1" ]]; then
@@ -68,6 +61,7 @@ echo "dump_dir=${DUMP_DIR}"
 echo "launching ${NPROC}-way data-parallel eval"
 
 python -m torch.distributed.run --nproc_per_node=${NPROC} \
+    --master_addr=127.0.0.1 --master_port=${MASTER_PORT} \
     -m evals.cruxeval.run_eval_codi \
     --adapter_dir "${ADAPTER_DIR}" \
     --base_model "${BASE_MODEL}" \
